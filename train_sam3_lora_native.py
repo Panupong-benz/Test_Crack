@@ -146,7 +146,7 @@ class COCOSegmentDataset(Dataset):
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
         print(f"  Categories: {self.categories}")
 
-        self.resolution = 1008
+        self.resolution = 640
         self.transform = v2.Compose([
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
@@ -805,10 +805,10 @@ class SAM3TrainerNative:
             apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
         )
         self.model = apply_lora_to_model(self.model, lora_config)
-
+        self.model.gradient_checkpointing_enable()
         stats = count_parameters(self.model)
         print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
-
+        
         self.model.to(self.device)
 
         # Wrap model with DDP if multi-GPU
