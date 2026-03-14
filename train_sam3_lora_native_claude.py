@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 SAM3 LoRA Training Script
@@ -1019,9 +1020,9 @@ class SAM3TrainerNative:
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
 
-            # --- gradient accumulation setup ---
+            # Gradient accumulation
             grad_accum_steps = self.config["training"].get("gradient_accumulation_steps", 1)
-            self.optimizer.zero_grad()  # reset ครั้งเดียวก่อนเริ่ม loop
+            self.optimizer.zero_grad()
 
             for step, batch_dict in enumerate(pbar):
                 input_batch = batch_dict["input"]
@@ -1031,11 +1032,9 @@ class SAM3TrainerNative:
 
                 # Forward pass + loss ภายใต้ autocast (bfloat16) เพื่อประหยัด VRAM
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
                     outputs_list = self.model(input_batch)
 
                     # Prepare targets for loss
-                    # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
                     find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
                     # Move targets to device
@@ -1045,43 +1044,35 @@ class SAM3TrainerNative:
                                 targets[k] = v.to(self.device)
 
                     # Add matcher indices to outputs (required by Sam3LossWrapper)
-                    # Use SAM3Output.iteration_mode to properly iterate over outputs
                     with SAM3Output.iteration_mode(
                         outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
                     ) as outputs_iter:
                         for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                            # stage_targets is a single target dict, replicate for all steps
                             stage_targets_list = [stage_targets] * len(stage_outputs)
                             for outputs, targets in zip(stage_outputs, stage_targets_list):
-                                # Compute indices for main output
                                 outputs["indices"] = self.matcher(outputs, targets)
-
-                                # Also add indices to auxiliary outputs if they exist
                                 if "aux_outputs" in outputs:
                                     for aux_out in outputs["aux_outputs"]:
                                         aux_out["indices"] = self.matcher(aux_out, targets)
 
-                    # Compute loss using Sam3LossWrapper
-                    # This handles num_boxes calculation and proper weighting
+                    # Compute loss
                     loss_dict = self.loss_wrapper(outputs_list, find_targets)
-
-                    # Extract total loss และหารด้วย grad_accum_steps เพื่อ scale gradient
                     total_loss = loss_dict[CORE_LOSS_KEY] / grad_accum_steps
 
-                # Backward (สะสม gradient ไปเรื่อยๆ โดยไม่ zero_grad)
+                # Backward — สะสม gradient โดยไม่ zero_grad
                 total_loss.backward()
 
-                # Update weights เมื่อสะสม gradient ครบ grad_accum_steps แล้ว
+                # Update weights เมื่อสะสม gradient ครบ grad_accum_steps
                 if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in self.model.parameters() if p.requires_grad],
                         self.config["training"].get("max_grad_norm", 1.0)
                     )
                     self.optimizer.step()
-                    self.optimizer.zero_grad()  # reset หลัง update เท่านั้น
-                    torch.cuda.empty_cache()    # คืน VRAM ที่ไม่ใช้หลังแต่ละ update
+                    self.optimizer.zero_grad()
+                    torch.cuda.empty_cache()
 
-                # Track training loss (คูณกลับเพื่อให้แสดงค่า loss จริง)
+                # Track training loss
                 train_losses.append(total_loss.item() * grad_accum_steps)
                 pbar.set_postfix({"loss": total_loss.item() * grad_accum_steps})
 
