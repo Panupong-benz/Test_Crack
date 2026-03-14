@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 SAM3 LoRA Training Script
@@ -147,7 +146,7 @@ class COCOSegmentDataset(Dataset):
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
         print(f"  Categories: {self.categories}")
 
-        self.resolution = 640
+        self.resolution = 1008  # ต้องตรงกับ img_size ที่ model_builder build ไว้ (patch_size=14, grid=72×72)
         self.transform = v2.Compose([
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
