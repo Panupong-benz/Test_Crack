@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 SAM3 LoRA Training Script
@@ -806,7 +805,12 @@ class SAM3TrainerNative:
             apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
         )
         self.model = apply_lora_to_model(self.model, lora_config)
-        self.model.gradient_checkpointing_enable()
+
+        # Sam3Image เป็น nn.Module ธรรมดา ไม่มี gradient_checkpointing_enable()
+        # เปิด gradient checkpointing แบบ manual บน submodule ที่รองรับ
+        for module in self.model.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
         stats = count_parameters(self.model)
         print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
         
