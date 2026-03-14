@@ -84,7 +84,7 @@ training:
 
   mixed_precision: "bf16"    # Use bfloat16 if available
   seed: 42
-  gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
+  gradient_accumulation_steps: 32  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
   output_dir: "outputs/sam3_lora_full"
