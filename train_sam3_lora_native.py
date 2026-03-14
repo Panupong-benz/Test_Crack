@@ -825,7 +825,8 @@ class SAM3TrainerNative:
         self._unwrapped_model = self.model.module if self.multi_gpu else self.model
 
         # Optimizer
-        self.optimizer = AdamW(
+        import bitsandbytes as bnb
+        self.optimizer = bnb.optim.AdamW8bit(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=float(self.config["training"]["learning_rate"]),
             weight_decay=self.config["training"]["weight_decay"]
