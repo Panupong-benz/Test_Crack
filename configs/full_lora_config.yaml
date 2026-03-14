@@ -73,8 +73,8 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 30       # Reduced from 500 (small dataset overfits quickly)
-  warmup_steps: 50     # Reduced from 1000 (proportional to dataset size)
+  num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
+  warmup_steps: 150     # Reduced from 1000 (proportional to dataset size)
   lr_scheduler: "cosine"
 
   logging_steps: 10
