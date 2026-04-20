@@ -32,6 +32,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from pathlib import Path
 import numpy as np
+import cv2
 from PIL import Image as PILImage
 import contextlib
 from torch.amp import autocast
@@ -54,6 +55,8 @@ from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, coun
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
+from tile_dataset import TiledCOCODataset, WeightedDistributedSampler
+from cldice_loss import MasksWithCLDice
 
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
@@ -152,9 +155,50 @@ class COCOSegmentDataset(Dataset):
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
     def __len__(self):
         return len(self.image_ids)
+
+    def _enhance_bgr(self, img_bgr: np.ndarray) -> np.ndarray:
+        # CLAHE on L channel (preserves marker hue)
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = self._clahe.apply(l)
+        out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        # Marker channel boost (BGR: 0=B, 2=R)
+        out = out.astype(np.float32)
+        out[:, :, 2] = np.clip(out[:, :, 2] * 1.3, 0, 255)
+        out[:, :, 0] = np.clip(out[:, :, 0] * 1.2, 0, 255)
+        out = out.astype(np.uint8)
+
+        # Unsharp mask
+        blur = cv2.GaussianBlur(out, (0, 0), 1.0)
+        out = cv2.addWeighted(out, 2.5, blur, -1.5, 0)
+        return out
+
+    def _letterbox_pad(self, img_bgr: np.ndarray):
+        """Pad (and optionally downscale) to (resolution, resolution) using mean
+        pixel value. Never upscales — preserves crack edge fidelity at native res."""
+        h, w = img_bgr.shape[:2]
+        scale = min(1.0, self.resolution / max(h, w))
+        if scale != 1.0:
+            new_w = int(round(w * scale))
+            new_h = int(round(h * scale))
+            img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            new_w, new_h = w, h
+        pad_top = (self.resolution - new_h) // 2
+        pad_bottom = self.resolution - new_h - pad_top
+        pad_left = (self.resolution - new_w) // 2
+        pad_right = self.resolution - new_w - pad_left
+        border_val = int(img_bgr.mean())
+        padded = cv2.copyMakeBorder(
+            img_bgr, pad_top, pad_bottom, pad_left, pad_right,
+            cv2.BORDER_CONSTANT, value=(border_val, border_val, border_val),
+        )
+        return padded, scale, pad_left, pad_top, new_w, new_h
 
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
@@ -165,8 +209,11 @@ class COCOSegmentDataset(Dataset):
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        # Resize image
-        pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
+        # Preprocess (CLAHE + channel boost + unsharp) then mean-pad to 1008
+        img_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        img_bgr = self._enhance_bgr(img_bgr)
+        img_bgr, scale, pad_left, pad_top, new_w, new_h = self._letterbox_pad(img_bgr)
+        pil_image = PILImage.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
         # Transform to tensor
         image_tensor = self.transform(pil_image)
@@ -176,10 +223,6 @@ class COCOSegmentDataset(Dataset):
 
         objects = []
         object_class_names = []
-
-        # Scale factors
-        scale_w = self.resolution / orig_w
-        scale_h = self.resolution / orig_h
 
         for i, ann in enumerate(annotations):
             # Get bbox - format is [x, y, width, height] in COCO format
@@ -198,12 +241,12 @@ class COCOSegmentDataset(Dataset):
             cx = x + w / 2.0
             cy = y + h / 2.0
 
-            # Scale to resolution and normalize to [0, 1]
+            # Apply letterbox transform (scale + pad), then normalize to [0, 1]
             box_tensor = torch.tensor([
-                cx * scale_w / self.resolution,
-                cy * scale_h / self.resolution,
-                w * scale_w / self.resolution,
-                h * scale_h / self.resolution,
+                (cx * scale + pad_left) / self.resolution,
+                (cy * scale + pad_top)  / self.resolution,
+                (w  * scale)            / self.resolution,
+                (h  * scale)            / self.resolution,
             ], dtype=torch.float32)
 
             # Handle segmentation mask (polygon or RLE format)
@@ -227,12 +270,18 @@ class COCOSegmentDataset(Dataset):
                         segment = None
                         continue
 
-                    # Resize mask to model resolution
+                    # Match the image's letterbox transform: scale + zero-pad
                     mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
-                    mask_t = torch.nn.functional.interpolate(
+                    if scale != 1.0:
+                        mask_t = torch.nn.functional.interpolate(
+                            mask_t, size=(new_h, new_w), mode="nearest"
+                        )
+                    pad_right  = self.resolution - new_w - pad_left
+                    pad_bottom = self.resolution - new_h - pad_top
+                    mask_t = torch.nn.functional.pad(
                         mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
+                        (pad_left, pad_right, pad_top, pad_bottom),
+                        mode="constant", value=0.0,
                     )
                     segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
 
@@ -861,14 +910,16 @@ class SAM3TrainerNative:
                 use_presence=True,
                 pad_n_queries=200,
             ),
-            Masks(
+            MasksWithCLDice(
                 weight_dict={
-                    "loss_mask": 200.0,  # Much higher weight for mask loss!
-                    "loss_dice": 10.0
+                    "loss_mask":   200.0,
+                    "loss_dice":    50.0,
+                    "loss_cldice":  30.0,
                 },
-                focal_alpha=0.25,
-                focal_gamma=2.0,
-                compute_aux=False
+                focal_alpha=0.85,
+                focal_gamma=3.0,
+                cldice_iters=3,
+                compute_aux=False,
             )
         ]
 
@@ -894,9 +945,26 @@ class SAM3TrainerNative:
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
 
-        # Load datasets using COCO format
+        # Choose dataset class based on config (default: tile-based for crack thinness)
+        tile_cfg = self.config["training"].get("tiling", {}) or {}
+        use_tiles = tile_cfg.get("enabled", True)
+
+        def _make_dataset(split: str, train_mode: bool):
+            if use_tiles:
+                return TiledCOCODataset(
+                    data_dir=data_dir,
+                    split=split,
+                    tile_size=tile_cfg.get("tile_size", 1008),
+                    overlap=tile_cfg.get("overlap", 0.25),
+                    min_crack_pixels=tile_cfg.get("min_crack_pixels", 0) if train_mode else 0,
+                    random_offset=tile_cfg.get("random_offset", True) and train_mode,
+                    augment=tile_cfg.get("augment", True) and train_mode,
+                    image_cache_size=tile_cfg.get("image_cache_size", 8),
+                )
+            return COCOSegmentDataset(data_dir=data_dir, split=split)
+
         print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        train_ds = _make_dataset("train", train_mode=True)
 
         # Check if validation data exists
         has_validation = False
@@ -904,10 +972,10 @@ class SAM3TrainerNative:
 
         try:
             print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
+            val_ds = _make_dataset("valid", train_mode=False)
             if len(val_ds) > 0:
                 has_validation = True
-                print_rank0(f"Found validation data: {len(val_ds)} images")
+                print_rank0(f"Found validation data: {len(val_ds)} samples")
             else:
                 print_rank0(f"Validation dataset is empty.")
                 val_ds = None
@@ -921,11 +989,43 @@ class SAM3TrainerNative:
         def collate_fn(batch):
             return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
 
-        # Create samplers for distributed training
+        # Create samplers for training
         train_sampler = None
         val_sampler = None
 
-        if self.multi_gpu:
+        sampling_cfg = self.config["training"].get("sampling", {}) or {}
+        use_weighted = bool(sampling_cfg.get("enabled", False)) and use_tiles
+        if use_weighted and not hasattr(train_ds, "compute_tile_weights"):
+            print_rank0("Weighted sampling requested but dataset does not "
+                        "expose tile stats; falling back to uniform.")
+            use_weighted = False
+
+        if use_weighted:
+            print_rank0("\nBuilding class-balanced tile sampler...")
+            weights = train_ds.compute_tile_weights(
+                num_bins=int(sampling_cfg.get("num_bins", 5)),
+                power=float(sampling_cfg.get("power", 1.0)),
+                empty_tile_weight=float(sampling_cfg.get("empty_tile_weight", 0.1)),
+                verbose=True,
+            )
+            num_samples = sampling_cfg.get("num_samples", None)
+            if num_samples is None:
+                num_samples = len(train_ds)
+            train_sampler = WeightedDistributedSampler(
+                weights=weights,
+                num_samples=int(num_samples),
+                num_replicas=self.world_size if self.multi_gpu else 1,
+                rank=get_rank() if self.multi_gpu else 0,
+                seed=int(self.config["training"].get("seed", 42)),
+            )
+            if has_validation and self.multi_gpu:
+                val_sampler = DistributedSampler(
+                    val_ds,
+                    num_replicas=self.world_size,
+                    rank=get_rank(),
+                    shuffle=False,
+                )
+        elif self.multi_gpu:
             train_sampler = DistributedSampler(
                 train_ds,
                 num_replicas=self.world_size,
@@ -1009,8 +1109,8 @@ class SAM3TrainerNative:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(epochs):
-            # Set epoch for distributed sampler (required for proper shuffling)
-            if self.multi_gpu and train_sampler is not None:
+            # Set epoch for distributed / weighted samplers (per-epoch reshuffle)
+            if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
 
             # Track training losses for this epoch
