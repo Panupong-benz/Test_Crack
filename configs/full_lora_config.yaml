@@ -66,6 +66,30 @@ training:
   batch_size: 2      # Increased from 1 to reduce gradient variance
   num_workers: 4        # Increase for better data loading
 
+  # Tile-based training: crop native-resolution tiles instead of downscaling
+  # whole-wall photos to 1008. Hairline cracks (1-3 px in the camera image)
+  # become sub-pixel when downscaled — tiling preserves them.
+  tiling:
+    enabled: true            # set false to use legacy COCOSegmentDataset
+    tile_size: 1008          # must equal SAM3 input resolution
+    overlap: 0.25            # 25% overlap between adjacent tiles
+    min_crack_pixels: 0      # 0=keep all tiles, >0=skip near-empty tiles in training
+    random_offset: true      # jitter tile origin per epoch (training only)
+    augment: true            # flip/rot90/color jitter (training only)
+    image_cache_size: 8      # number of source images to keep in RAM
+
+  # Class-balanced tile sampling (WeightedRandomSampler over tiles).
+  # Bins positive tiles by log(1+crack_pixels) into `num_bins` equal-width bins
+  # and upweights rare (dense-crack) bins: weight = (1/bin_count)^power.
+  # Empty tiles (0 crack pixels) get `empty_tile_weight * mean_positive_weight`.
+  # Works for both single-GPU and DDP (rank-sliced from a shared draw).
+  sampling:
+    enabled: true            # false = plain shuffle / DistributedSampler
+    num_bins: 5              # log-space density bins for positive tiles
+    power: 1.0               # 1.0 = full inverse-frequency, 0.5 = sqrt, 0.0 = uniform
+    empty_tile_weight: 0.1   # relative weight of empty tiles vs mean positive
+    num_samples: null        # null = len(train_ds) per epoch
+
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
   adam_beta1: 0.9
