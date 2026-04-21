@@ -69,7 +69,7 @@ training:
   # On vast.ai: download once to persistent /workspace, e.g.
   #   python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('facebook/sam3','sam3.pt'))"
   # then paste the printed path here. Leave null to fall back to HF cache.
-  checkpoint_path: "/workspace/hf_cache/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
+  checkpoint_path: "/root/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
 
   batch_size: 2      # Increased from 1 to reduce gradient variance
   num_workers: 4        # Increase for better data loading
