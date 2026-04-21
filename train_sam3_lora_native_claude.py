@@ -918,7 +918,9 @@ class SAM3TrainerNative:
                 },
                 focal_alpha=0.85,
                 focal_gamma=3.0,
-                cldice_iters=3,
+                cldice_iters=int(self.config["training"].get("cldice", {}).get("iters", 3)),
+                cldice_max_size=int(self.config["training"].get("cldice", {}).get("max_size", 384)),
+                cldice_use_checkpoint=bool(self.config["training"].get("cldice", {}).get("use_checkpoint", False)),
                 compute_aux=False,
             )
         ]
@@ -948,6 +950,8 @@ class SAM3TrainerNative:
         # Choose dataset class based on config (default: tile-based for crack thinness)
         tile_cfg = self.config["training"].get("tiling", {}) or {}
         use_tiles = tile_cfg.get("enabled", True)
+        sampling_cfg = self.config["training"].get("sampling", {}) or {}
+        need_stats = bool(sampling_cfg.get("enabled", False)) and use_tiles
 
         def _make_dataset(split: str, train_mode: bool):
             if use_tiles:
@@ -960,6 +964,7 @@ class SAM3TrainerNative:
                     random_offset=tile_cfg.get("random_offset", True) and train_mode,
                     augment=tile_cfg.get("augment", True) and train_mode,
                     image_cache_size=tile_cfg.get("image_cache_size", 8),
+                    compute_tile_stats=need_stats and train_mode,
                 )
             return COCOSegmentDataset(data_dir=data_dir, split=split)
 
@@ -993,7 +998,6 @@ class SAM3TrainerNative:
         train_sampler = None
         val_sampler = None
 
-        sampling_cfg = self.config["training"].get("sampling", {}) or {}
         use_weighted = bool(sampling_cfg.get("enabled", False)) and use_tiles
         if use_weighted and not hasattr(train_ds, "compute_tile_weights"):
             print_rank0("Weighted sampling requested but dataset does not "
