@@ -100,18 +100,23 @@ class TiledCOCODataset(Dataset):
         random_offset: bool = True,
         augment: bool = True,
         image_cache_size: int = 8,
+        compute_tile_stats: bool = False,
     ):
         """
         Args:
-            data_dir:          Root directory containing train/valid/test/.
-            split:             'train', 'valid', or 'test'.
-            tile_size:         Tile edge length (must equal SAM3 input resolution).
-            overlap:           Fractional overlap between adjacent tiles (0.0-0.5).
-            min_crack_pixels:  Drop tiles whose union mask has fewer than this many
-                               foreground pixels. 0 = keep all tiles (incl. negatives).
-            random_offset:     Jitter tile origin per epoch (training only).
-            augment:           Apply flip / rot90 / color jitter (training only).
-            image_cache_size:  Number of decoded source images to keep in RAM.
+            data_dir:           Root directory containing train/valid/test/.
+            split:              'train', 'valid', or 'test'.
+            tile_size:          Tile edge length (must equal SAM3 input resolution).
+            overlap:            Fractional overlap between adjacent tiles (0.0-0.5).
+            min_crack_pixels:   Drop tiles whose union mask has fewer than this many
+                                foreground pixels. 0 = keep all tiles (incl. negatives).
+            random_offset:      Jitter tile origin per epoch (training only).
+            augment:            Apply flip / rot90 / color jitter (training only).
+            image_cache_size:   Number of decoded source images to keep in RAM.
+            compute_tile_stats: Decode all masks at init to populate tile_crack_pixels
+                                (required for compute_tile_weights / weighted sampler).
+                                Adds ~1-3 min for 500 images. Auto-enabled when
+                                min_crack_pixels > 0.
         """
         self.data_dir = Path(data_dir)
         self.split = split
@@ -121,6 +126,7 @@ class TiledCOCODataset(Dataset):
         self.min_crack_pixels = min_crack_pixels
         self.random_offset = random_offset and (split == "train")
         self.augment = augment and (split == "train")
+        self._compute_tile_stats = compute_tile_stats or (min_crack_pixels > 0)
 
         ann_file = self.split_dir / "_annotations.coco.json"
         if not ann_file.exists():
@@ -192,8 +198,13 @@ class TiledCOCODataset(Dataset):
         for img_id in sorted(self.images.keys()):
             info = self.images[img_id]
             w, h = info["width"], info["height"]
-
             origins = self._tile_origins(w, h)
+
+            if not self._compute_tile_stats:
+                for x, y in origins:
+                    specs.append((img_id, x, y))
+                    self.tile_crack_pixels.append(-1)
+                continue
 
             if img_id not in union_cache:
                 union = np.zeros((h, w), dtype=np.uint8)
