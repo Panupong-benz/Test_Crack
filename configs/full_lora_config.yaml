@@ -90,6 +90,13 @@ training:
     empty_tile_weight: 0.1   # relative weight of empty tiles vs mean positive
     num_samples: null        # null = len(train_ds) per epoch
 
+  # clDice memory controls. Skeletonisation on 1008x1008 masks with iters=3
+  # blows up autograd memory — downsample before skeletonise (topology survives).
+  cldice:
+    iters: 3                 # morphological thinning iterations
+    max_size: 384            # downsample pred/target so max(H,W) <= this before skeletonise. <=0 disables.
+    use_checkpoint: false    # gradient checkpointing on pred skeletonise (slower, saves more memory)
+
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
   adam_beta1: 0.9
