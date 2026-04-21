@@ -22,6 +22,7 @@ Multi-GPU Training:
 
 import os
 import argparse
+import time
 import yaml
 import json
 import torch
@@ -829,17 +830,32 @@ class SAM3TrainerNative:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Build Model
+        #
+        # Startup optimizations:
+        #   - If `training.checkpoint_path` is set in the config, we skip
+        #     hf_hub_download entirely (no network round-trip on every run).
+        #   - Otherwise, set env HF_HUB_OFFLINE=1 after the first download so
+        #     huggingface_hub reads from the local cache without ETag checks.
+        ckpt_path = self.config.get("training", {}).get("checkpoint_path") or None
+        if ckpt_path and not os.path.isfile(ckpt_path):
+            print_rank0(f"WARN: checkpoint_path {ckpt_path!r} not found — falling back to HF")
+            ckpt_path = None
+
         print_rank0("Building SAM3 model...")
+        _t0 = time.time()
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
+            checkpoint_path=ckpt_path,
+            load_from_HF=(ckpt_path is None),
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=False
         )
+        print_rank0(f"  [timing] build + load checkpoint: {time.time()-_t0:.1f}s")
 
         # Apply LoRA
         print_rank0("Applying LoRA...")
+        _t0 = time.time()
         lora_cfg = self.config["lora"]
         lora_config = LoRAConfig(
             rank=lora_cfg["rank"],
@@ -854,6 +870,7 @@ class SAM3TrainerNative:
             apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
         )
         self.model = apply_lora_to_model(self.model, lora_config)
+        print_rank0(f"  [timing] apply LoRA: {time.time()-_t0:.1f}s")
 
         # Sam3Image เป็น nn.Module ธรรมดา ไม่มี gradient_checkpointing_enable()
         # เปิด gradient checkpointing แบบ manual บน submodule ที่รองรับ
@@ -862,8 +879,12 @@ class SAM3TrainerNative:
                 module.gradient_checkpointing = True
         stats = count_parameters(self.model)
         print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
-        
+
+        _t0 = time.time()
         self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        print_rank0(f"  [timing] move to {self.device}: {time.time()-_t0:.1f}s")
 
         # Wrap model with DDP if multi-GPU
         if self.multi_gpu:
@@ -879,12 +900,14 @@ class SAM3TrainerNative:
         self._unwrapped_model = self.model.module if self.multi_gpu else self.model
 
         # Optimizer
+        _t0 = time.time()
         import bitsandbytes as bnb
         self.optimizer = bnb.optim.AdamW8bit(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=float(self.config["training"]["learning_rate"]),
             weight_decay=self.config["training"]["weight_decay"]
         )
+        print_rank0(f"  [timing] build 8-bit AdamW: {time.time()-_t0:.1f}s")
         
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
@@ -1044,14 +1067,24 @@ class SAM3TrainerNative:
                     shuffle=False
                 )
 
+        _nw = int(self.config["training"].get("num_workers", 0))
+        _loader_kwargs = dict(
+            collate_fn=collate_fn,
+            num_workers=_nw,
+            pin_memory=True,
+            persistent_workers=(_nw > 0),
+        )
+        if _nw > 0:
+            _loader_kwargs["prefetch_factor"] = int(
+                self.config["training"].get("prefetch_factor", 2)
+            )
+
         train_loader = DataLoader(
             train_ds,
             batch_size=self.config["training"]["batch_size"],
             shuffle=(train_sampler is None),  # Only shuffle if not using sampler
             sampler=train_sampler,
-            collate_fn=collate_fn,
-            num_workers=self.config["training"].get("num_workers", 0),
-            pin_memory=True
+            **_loader_kwargs,
         )
 
         if has_validation:
@@ -1060,9 +1093,7 @@ class SAM3TrainerNative:
                 batch_size=self.config["training"]["batch_size"],
                 shuffle=False,
                 sampler=val_sampler,
-                collate_fn=collate_fn,
-                num_workers=self.config["training"].get("num_workers", 0),
-                pin_memory=True
+                **_loader_kwargs,
             )
         else:
             val_loader = None
