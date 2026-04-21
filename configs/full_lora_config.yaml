@@ -63,8 +63,17 @@ lora:
 # Training settings
 training:
   data_dir: "/Test_Crack/data"  # Root directory containing train/valid/test folders with COCO annotations
+
+  # Local SAM3 checkpoint path. If set and the file exists, we skip
+  # hf_hub_download entirely (no network round-trip on every run).
+  # On vast.ai: download once to persistent /workspace, e.g.
+  #   python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('facebook/sam3','sam3.pt'))"
+  # then paste the printed path here. Leave null to fall back to HF cache.
+  checkpoint_path: null
+
   batch_size: 2      # Increased from 1 to reduce gradient variance
   num_workers: 4        # Increase for better data loading
+  prefetch_factor: 2    # Per-worker prefetch (only used when num_workers > 0)
 
   # Tile-based training: crop native-resolution tiles instead of downscaling
   # whole-wall photos to 1008. Hairline cracks (1-3 px in the camera image)
