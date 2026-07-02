@@ -28,12 +28,15 @@ PRED_DIR = r"D:\THESIS\03_annotation\preds_RW20"     # infer_sam.py outputs; "" 
 OUT_DIR  = r"D:\THESIS\03_annotation\compare_RW20"
 PANEL_MAX_W = 1100      # downscale each panel half to this width (0 = no resize)
 GT_COLOR = (0, 255, 0)  # BGR green for ground-truth label
+ONLY_WITH_PRED = True   # skip test images that have no matching prediction (we infer a subset,
+                        # so the rest would be label-only panels — this keeps the folder clean)
 # -------------------------
 
 # ----- ENV OVERRIDES (let run_all.sh drive this per fold) -----
 TEST_DIR = os.environ.get("CT_TEST_DIR", TEST_DIR)
 PRED_DIR = os.environ.get("CT_PRED_DIR", PRED_DIR)
 OUT_DIR  = os.environ.get("CT_OUT_DIR",  OUT_DIR)
+ONLY_WITH_PRED = os.environ.get("CT_ONLY_WITH_PRED", str(ONLY_WITH_PRED)).lower() in ("1", "true", "yes")
 # --------------------------------------------------------------
 
 ANN = "_annotations.coco.json"
@@ -103,6 +106,9 @@ def main():
         gt = label(draw_gt(img.copy(), polys), f"LABEL (GT): {len(polys)} crack(s)", GT_COLOR)
 
         pred_path = find_pred(PRED_DIR, stem(im["file_name"]))
+        if pred_path is None and ONLY_WITH_PRED:
+            n_nopred += 1
+            continue                      # subset infer: no prediction -> don't emit a label-only panel
         if pred_path:
             pred = cv2.imread(pred_path)
             pred = cv2.resize(pred, (gt.shape[1], gt.shape[0]))
