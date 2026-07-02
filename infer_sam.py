@@ -1249,11 +1249,20 @@ def main():
         help="Seed for torch / numpy / random, and enable cudnn.deterministic "
              "(default: 0). Set to make runs bit-reproducible."
     )
+    parser.add_argument(
+        "--save-mask", action="store_true",
+        help="Also save the binary union mask (0/255) as {output_base}_mask.png "
+             "for downstream geometry/measurement tools."
+    )
+    parser.add_argument(
+        "--save-json", action="store_true",
+        help="Also save crack geometry (per-component contour polygons, bbox, "
+             "centroid [+ skeleton pts]) as {output_base}.json."
+    )
 
     args = parser.parse_args()
 
-    # ---- Reproducibility (thesis report §4.3 / §6) ---------------------
-    # Do this BEFORE any tensor allocation, model build, or dataloader
+    # ---- Reproducibility (thesis report §4.3 / §6) ---------------------    # Do this BEFORE any tensor allocation, model build, or dataloader
     # shuffling so every downstream op sees the same seeded state.
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1309,6 +1318,50 @@ def main():
         show_boxes=args.boundingbox,
         show_masks=not args.no_masks
     )
+
+    # ---- Save raw binary mask + geometry JSON for downstream tools -------
+    # The overlay PNG above is for viewing only; these two are the DATA the
+    # crack-linking / mechanics tools consume (mask pixels + per-crack contours).
+    if args.save_mask or args.save_json:
+        import cv2 as _cv2, json as _json
+        base, _ = os.path.splitext(args.output)
+        entry = None
+        for k in sorted(kk for kk in results.keys() if not str(kk).startswith('_')):
+            if results[k].get('masks') is not None:
+                entry = results[k]; break
+        if entry is None:
+            print("⚠️  no mask to save (0 detections)")
+        else:
+            masks = np.asarray(entry['masks'])                       # (N,H,W) or (1,H,W)
+            union = (masks.any(axis=0) if masks.ndim == 3 else masks) > 0
+            H, W = union.shape
+            if args.save_mask:
+                _cv2.imwrite(f"{base}_mask.png", (union.astype(np.uint8) * 255))
+                print(f"💾 Saved binary mask: {base}_mask.png")
+            if args.save_json:
+                m8 = union.astype(np.uint8)
+                n_lab, labels, stats, cents = _cv2.connectedComponentsWithStats(m8, connectivity=8)
+                comps = []
+                for lab in range(1, n_lab):
+                    comp = (labels == lab).astype(np.uint8)
+                    cnts, _ = _cv2.findContours(comp, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+                    polys = [c.reshape(-1).tolist() for c in cnts if len(c) >= 3]
+                    comps.append({
+                        "id": int(lab),
+                        "area_px": int(stats[lab, _cv2.CC_STAT_AREA]),
+                        "bbox": [int(stats[lab, _cv2.CC_STAT_LEFT]), int(stats[lab, _cv2.CC_STAT_TOP]),
+                                 int(stats[lab, _cv2.CC_STAT_WIDTH]), int(stats[lab, _cv2.CC_STAT_HEIGHT])],
+                        "centroid": [float(cents[lab][0]), float(cents[lab][1])],
+                        "polygons": polys,
+                    })
+                out = {"image": os.path.basename(args.image), "width": int(W), "height": int(H),
+                       "prompt": entry.get("prompt"), "num_components": len(comps), "components": comps}
+                skel = entry.get("skeleton")
+                if skel is not None:
+                    ys, xs = np.nonzero(np.asarray(skel))
+                    out["skeleton_xy"] = [[int(a), int(b)] for a, b in zip(xs.tolist(), ys.tolist())]
+                _json.dump(out, open(f"{base}.json", "w"))
+                print(f"💾 Saved geometry JSON: {base}.json ({len(comps)} components)")
 
     # Optional: save the CLAHE-preprocessed image for debug / comparison
     if args.save_preprocessed:

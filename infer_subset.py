@@ -24,6 +24,9 @@ N_IMAGES   = 50                         # cap on how many to run
 PROMPT     = "crack"
 THRESHOLD  = 0.3
 SEED       = 42
+SLIDING      = True     # sliding-window (tiled full-res) inference — finer masks on big overview shots
+TILE_SIZE    = 1008     # MUST match the training tile size (full_lora_config tile_size) so scale matches the model
+TILE_OVERLAP = 0.25     # match training overlap
 # -------------------------
 
 # ----- ENV OVERRIDES (let run_all.sh drive this per fold) -----
@@ -91,10 +94,14 @@ def main():
     os.makedirs(PRED_DIR, exist_ok=True)
     for i, fn in enumerate(picked, 1):
         out = os.path.join(PRED_DIR, os.path.splitext(fn)[0] + ".png")
-        cmd = ["python", os.path.join(REPO_DIR, "infer_sam.py"),
+        cmd = ["python3", os.path.join(REPO_DIR, "infer_sam.py"),
                "--config", CONFIG, "--weights", WEIGHTS,
                "--image", os.path.join(TEST_DIR, fn),
-               "--prompt", PROMPT, "--output", out, "--threshold", str(THRESHOLD)]
+               "--prompt", PROMPT, "--output", out, "--threshold", str(THRESHOLD),
+               "--save-mask", "--save-json", "--skeletonize"]
+        if SLIDING:
+            cmd += ["--sliding-window", "--tile-size", str(TILE_SIZE),
+                    "--tile-overlap", str(TILE_OVERLAP), "--no-progress"]
         print(f"[{i}/{len(picked)}] {fn}")
         r = subprocess.run(cmd)
         if r.returncode != 0:
