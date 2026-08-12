@@ -1,0 +1,5 @@
+# Shell scripts must stay LF or they break on the Linux GPU box
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
