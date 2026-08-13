@@ -15,9 +15,11 @@
 set -uo pipefail
 
 # ===================== CONFIG (edit) =====================
-REPO_DIR="/Test_Crack"
-FULL_CONFIG="${REPO_DIR}/configs/full_lora_config.yaml"
-SRC_FOLD="/workspace/folds/fold_RW20"     # an existing fold (has train/ valid/ test/)
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+# v2 config (rank 32) so the smoke gates VRAM at the value the real run will use
+FULL_CONFIG="${FULL_CONFIG:-${REPO_DIR}/configs/full_lora_config_v2.yaml}"
+LOWO_ROOT="$(cat /workspace/.lowo_root 2>/dev/null || echo /workspace/folds)"
+SRC_FOLD="${SRC_FOLD:-${LOWO_ROOT}/fold_RW20}" # an existing fold (has train/ valid/ test/)
 SMOKE_DIR="/workspace/smoke"              # scratch dir for the smoke fold + config
 N_TRAIN=8                                 # images sampled into the smoke train split
 N_EVAL=3                                  # images for valid and for test (each)

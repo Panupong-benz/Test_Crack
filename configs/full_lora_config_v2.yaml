@@ -1,0 +1,144 @@
+# SAM3 LoRA Training Configuration
+# Full LoRA configuration - applies LoRA to ALL transformer components
+# Use this for maximum adaptation capacity (more trainable parameters)
+
+# Model settings
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+
+# LoRA settings
+lora:
+  rank: 32                   # v2: doubled from 16 - the 5090 32GB removes the OOM ceiling that forced 16
+  alpha: 64                  # 2x rank (scaling factor)
+  dropout: 0.1               # Some dropout for regularization
+
+  # Target modules for SAM3 architecture
+  # SAM3 uses different naming conventions than standard transformers:
+  #
+  # VISION BACKBONE (ViT-style):
+  #   - "qkv"    : Fused Q/K/V projection (backbone.vision_backbone.trunk.blocks.X.attn.qkv)
+  #   - "proj"   : Attention output projection (backbone.vision_backbone.trunk.blocks.X.attn.proj)
+  #   - "fc1"    : MLP first layer (backbone.vision_backbone.trunk.blocks.X.mlp.fc1)
+  #   - "fc2"    : MLP second layer (backbone.vision_backbone.trunk.blocks.X.mlp.fc2)
+  #
+  # LANGUAGE BACKBONE (CLIP-style):
+  #   - "q_proj", "k_proj", "v_proj" : Attention projections (via MultiheadAttentionLoRA replacement)
+  #   - "out_proj" : Attention output projection
+  #   - "c_fc"   : MLP first layer (backbone.language_backbone.encoder.transformer.resblocks.X.mlp.c_fc)
+  #   - "c_proj" : MLP second layer (backbone.language_backbone.encoder.transformer.resblocks.X.mlp.c_proj)
+  #
+  # TRANSFORMER ENCODER/DECODER:
+  #   - "q_proj", "k_proj", "v_proj" : Attention projections (via MultiheadAttentionLoRA replacement)
+  #   - "out_proj" : Attention output projection
+  #   - "linear1" : FFN first layer (transformer.encoder/decoder.layers.X.linear1)
+  #   - "linear2" : FFN second layer (transformer.encoder/decoder.layers.X.linear2)
+  #
+  target_modules:
+    # Standard attention projections (for replaced MultiheadAttention modules)
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+    # Vision backbone (ViT-style)
+    - "qkv"                  # Fused Q/K/V projection in vision backbone
+    - "proj"                 # Output projection in vision backbone attention
+    - "fc1"                  # Vision backbone MLP first layer
+    - "fc2"                  # Vision backbone MLP second layer
+    # Language backbone (CLIP-style)
+    - "c_fc"                 # Language backbone MLP first layer
+    - "c_proj"               # Language backbone MLP second layer
+    # Transformer encoder/decoder FFN
+    - "linear1"              # Transformer FFN first layer
+    - "linear2"              # Transformer FFN second layer
+
+  # Apply LoRA to ALL components for maximum adaptation
+  apply_to_vision_encoder: true    # Vision backbone (ViT)
+  apply_to_text_encoder: true      # Language backbone (CLIP text encoder)
+  apply_to_geometry_encoder: true  # Geometry encoder for prompts
+  apply_to_detr_encoder: true      # DETR-style transformer encoder
+  apply_to_detr_decoder: true      # DETR-style transformer decoder
+  apply_to_mask_decoder: true      # Mask prediction head
+
+# Training settings
+training:
+  data_dir: "/Test_Crack/data"  # Root directory containing train/valid/test folders with COCO annotations
+
+  # Local SAM3 checkpoint path. If set and the file exists, we skip
+  # hf_hub_download entirely (no network round-trip on every run).
+  # On vast.ai: download once to persistent /workspace, e.g.
+  #   python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('facebook/sam3','sam3.pt'))"
+  # then paste the printed path here. Leave null to fall back to HF cache.
+  checkpoint_path: "/root/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
+
+  batch_size: 2      # Increased from 1 to reduce gradient variance
+  num_workers: 4        # Increase for better data loading
+  prefetch_factor: 2    # Per-worker prefetch (only used when num_workers > 0)
+
+  # Tile-based training: crop native-resolution tiles instead of downscaling
+  # whole-wall photos to 1008. Hairline cracks (1-3 px in the camera image)
+  # become sub-pixel when downscaled — tiling preserves them.
+  tiling:
+    enabled: true            # set false to use legacy COCOSegmentDataset
+    tile_size: 1008          # must equal SAM3 input resolution
+    overlap: 0.25            # 25% overlap between adjacent tiles
+    min_crack_pixels: 0      # 0=keep all tiles, >0=skip near-empty tiles in training
+    random_offset: true      # jitter tile origin per epoch (training only)
+    augment: true            # flip/rot90/color jitter (training only)
+    image_cache_size: 8      # number of source images to keep in RAM
+
+  # Class-balanced tile sampling (WeightedRandomSampler over tiles).
+  # Bins positive tiles by log(1+crack_pixels) into `num_bins` equal-width bins
+  # and upweights rare (dense-crack) bins: weight = (1/bin_count)^power.
+  # Empty tiles (0 crack pixels) get `empty_tile_weight * mean_positive_weight`.
+  # Works for both single-GPU and DDP (rank-sliced from a shared draw).
+  sampling:
+    enabled: true            # false = plain shuffle / DistributedSampler
+    num_bins: 5              # log-space density bins for positive tiles
+    power: 1.0               # 1.0 = full inverse-frequency, 0.5 = sqrt, 0.0 = uniform
+    empty_tile_weight: 0.1   # relative weight of empty tiles vs mean positive
+    num_samples: null        # null = len(train_ds) per epoch
+
+  # clDice memory controls. Skeletonisation on 1008x1008 masks with iters=3
+  # blows up autograd memory — downsample before skeletonise (topology survives).
+  cldice:
+    iters: 3                 # morphological thinning iterations
+    max_size: 384            # downsample pred/target so max(H,W) <= this before skeletonise. <=0 disables.
+    use_checkpoint: false    # gradient checkpointing on pred skeletonise (slower, saves more memory)
+
+  learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+
+  num_epochs: 24       # v2: July val_loss still falling at ep16/18 - give it headroom (best-ckpt guards overfit)
+  warmup_steps: 100     # Reduced from 1000 (proportional to dataset size)
+  lr_scheduler: "cosine"
+
+  logging_steps: 10
+  eval_steps: 100       # More frequent validation (from 500)
+  save_steps: 100       # More frequent checkpoints (from 1000)
+  save_total_limit: 5   # Keep more checkpoints
+
+  mixed_precision: "bf16"    # Use bfloat16 if available
+  seed: 42
+  gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
+
+output:
+  output_dir: "outputs/sam3_lora_full"
+  logging_dir: "logs"
+  save_lora_only: true
+  push_to_hub: false
+  hub_model_id: null
+
+evaluation:
+  metric: "iou"
+  save_predictions: false
+  compute_metrics_during_training: true
+
+hardware:
+  device: "cuda"
+  dataloader_pin_memory: true
+  use_compile: false

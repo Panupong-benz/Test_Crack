@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# run_all_v2.sh — the 2026-08 journal run: train + FULL evaluation per fold.
+# run_all_v2.sh — the 2026-08 journal run: train v2 + FULL evaluation per fold.
+#
+# v2 = rank-32 LoRA, 24 epochs (recall-oriented; see full_lora_config_v2.yaml).
+# The July rank-16 weights, if uploaded to /workspace/prev_weights/, are scored
+# on the same test split as a "v1" benchmark row.
 #
 # Per fold (RW20 then RW20T):
-#   train 18 epochs (skip if best_lora_weights.pt exists)
+#   train 24 epochs (skip if best_lora_weights.pt exists)
 #   -> validate_sam3_lora (mAP + cgF1, LoRA)          [instance metrics]
 #   -> infer_fused whole  on valid  -> threshold sweep -> t*
 #   -> infer_fused whole  on test   -> eval at t*      [PixelIoU/Dice/clDice,
@@ -18,11 +22,12 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK=/workspace
 LOWO_ROOT="$(cat $WORK/.lowo_root 2>/dev/null || echo $WORK/folds)"
-FULL_CONFIG="$REPO_DIR/configs/full_lora_config.yaml"
+FULL_CONFIG="$REPO_DIR/configs/full_lora_config_v2.yaml"   # v2: rank 32, see config comments
+V1_CONFIG="$REPO_DIR/configs/full_lora_config.yaml"        # rank 16 - REQUIRED to load July weights
 RUNS_DIR="$WORK/outputs/lowo"
 RESULTS_DIR="$WORK/results"
 FOLDS="${FOLDS:-RW20 RW20T}"
-EPOCHS="${EPOCHS:-18}"
+EPOCHS="${EPOCHS:-24}"
 DEVICE="${DEVICE:-0}"
 TILE_SIZE=1008
 TILE_OVERLAP=0.30
@@ -123,6 +128,22 @@ PY
     --meta_csv "$META_CSV" --out_dir "$RES/eval" --tag test_zeroshot \
     --panels 6 || echo "WARN base eval failed"
 
+  # v1 comparison: July rank-16 weights, uploaded manually via Jupyter to
+  # /workspace/prev_weights/fold_<X>_v1.pt. Loaded with the OLD config (rank 16)
+  # or the LoRA shapes will not match. Skipped silently when absent (RW20T
+  # was never trained in July, so it has no v1).
+  V1W="$WORK/prev_weights/fold_${FOLD}_v1.pt"
+  if [ -f "$V1W" ]; then
+    banner "FOLD $FOLD - v1 (July) weights on test at t*"
+    python3 infer_fused.py --config "$V1_CONFIG" --weights "$V1W" \
+      --data_dir "$DATA_DIR/test" --out_dir "$RES/preds_test_v1" \
+      --variants whole --det-threshold 0.05 || echo "WARN v1 infer failed"
+    python3 eval_metrics.py --data_dir "$DATA_DIR/test" \
+      --npz "$RES/preds_test_v1/whole" --threshold "$TSTAR" \
+      --meta_csv "$META_CSV" --out_dir "$RES/eval" --tag test_v1 \
+      --panels 6 || echo "WARN v1 eval failed"
+  fi
+
   banner "FOLD $FOLD - benchmark table"
   python3 - "$RES/eval" "$FOLD" <<'PY'
 import json
@@ -131,9 +152,10 @@ from pathlib import Path
 d = Path(sys.argv[1]); fold = sys.argv[2]
 rows = []
 for tag, label in [("test_zeroshot", "SAM3 zero-shot"),
-                   ("test_lora", "SAM3-LoRA (whole)"),
-                   ("test_tilemax", "LoRA + overlap max"),
-                   ("test_tilemean", "LoRA + overlap mean")]:
+                   ("test_v1", "LoRA v1 (Jul r16-18ep)"),
+                   ("test_lora", "LoRA v2 (r32-24ep)"),
+                   ("test_tilemax", "v2 + overlap max"),
+                   ("test_tilemean", "v2 + overlap mean")]:
     p = d / f"summary_{tag}.json"
     if not p.exists():
         continue

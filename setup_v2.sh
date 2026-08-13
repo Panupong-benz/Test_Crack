@@ -120,6 +120,10 @@ if [ "$MB" -lt 20000 ]; then
   echo "WARN: <20GB VRAM - run_all_v2.sh will use batch_size=1 / grad_accum=16"
 fi
 
+mkdir -p "$WORK/prev_weights"
+
 echo -e "\nsetup_v2 complete. Next:"
-echo "  bash smoke_test.sh          # gate (small 3-epoch run)"
-echo "  nohup bash run_all_v2.sh > /workspace/run.log 2>&1 &"
+echo "  1. (optional, for the v1 benchmark row) upload July weights via Jupyter to:"
+echo "       /workspace/prev_weights/fold_RW20_v1.pt"
+echo "  2. bash smoke_test.sh          # gate: rank-32 VRAM + 1-epoch sanity"
+echo "  3. nohup bash run_all_v2.sh > /workspace/run.log 2>&1 &"
