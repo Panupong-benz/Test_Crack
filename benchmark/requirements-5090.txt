@@ -1,0 +1,17 @@
+# Environment pin for vast.ai RTX 5090 (Blackwell sm_120) — benchmark rows A1-A6.
+# 5090 REQUIRES torch >= 2.7 built for CUDA 12.8; the local 2.6/cu124 stack
+# cannot run on it (docs/vastai_runbook.md SS1). Install with:
+#   pip install -r requirements-5090.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.1
+torchvision>=0.22
+bitsandbytes>=0.45.0          # Blackwell support (AdamW8bit for SAM3-LoRA row)
+segmentation-models-pytorch>=0.4.0   # A2 Unet / A3 DeepLabV3Plus / A4 Segformer
+nnunetv2>=2.5                 # A1
+pycocotools
+opencv-python-headless>=4.10
+scikit-image>=0.24
+numpy
+pyyaml
+pandas
+# sam3: installed from the project checkout / HF as on the training machine;
+# base checkpoint pulled from HF hub on the instance (HF_TOKEN if gated).
