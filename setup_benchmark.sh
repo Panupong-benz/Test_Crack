@@ -17,29 +17,53 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK=/workspace
 
 # ===================== CONFIG =====================
-# POOL_BM folds.zip: set FOLDS_GDRIVE_ID before running (new 7-wall pool,
-# NOT the old 2-fold zip). md5 recorded in benchmark_protocol.md Amendment A1.
+# We ship the POOL (one copy of every image), not the folds: each LOWO fold
+# holds the whole pool, so four folds upload every photo four times (measured
+# on POOL_D1: 614 MB pool vs 2456 MB of folds). lowo_split is deterministic,
+# so the folds are rebuilt here with symlinks and verified by REPRODUCING
+# folds_summary - a stronger gate than a zip checksum.
+# md5 recorded in benchmark_protocol.md Amendment A1/A1.3.
+POOL_ZIP="${POOL_ZIP:-$WORK/pool_BM.zip}"
 POOLBM_MD5="${POOLBM_MD5:-TBD-at-freeze}"
+TEST_WALLS="${TEST_WALLS:-RW20,RW20C,RW20L,RW20T}"
+TRAIN_ONLY="${TRAIN_ONLY:-RW40,N40,N20B}"
 # ==================================================
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 step() { echo -e "\n=== $* ==="; }
 
-step "A. base bootstrap (setup_v2.sh: GPU gate / deps / HF / folds)"
-bash "$REPO_DIR/setup_v2.sh" || die "setup_v2.sh failed"
-
-step "B. POOL_BM md5 gate"
-if [ -f "$WORK/folds.zip" ]; then
-  got=$(md5sum "$WORK/folds.zip" | cut -d' ' -f1)
-  echo "folds.zip md5 = $got   (expected: $POOLBM_MD5)"
+step "A. POOL -> folds (runs BEFORE setup_v2 so it finds them and skips gdown)"
+if [ -d "$WORK/folds" ] || ls -d "$WORK"/fold_* >/dev/null 2>&1; then
+  echo "folds already present - skipping pool build"
+elif [ -f "$POOL_ZIP" ]; then
+  got=$(md5sum "$POOL_ZIP" | cut -d' ' -f1)
+  echo "$(basename "$POOL_ZIP") md5 = $got   (expected: $POOLBM_MD5)"
   if [ "$POOLBM_MD5" != "TBD-at-freeze" ] && [ "$got" != "$POOLBM_MD5" ]; then
-    die "md5 mismatch — wrong folds zip (Amendment A1 records the frozen one)"
+    die "md5 mismatch - wrong pool archive (Amendment A1 records the frozen one)"
   fi
   [ "$POOLBM_MD5" = "TBD-at-freeze" ] && \
-    echo "WARN: POOLBM_MD5 not set — running unfrozen data (smoke only!)"
+    echo "WARN: POOLBM_MD5 not set - running unfrozen data (smoke only!)"
+  # python zipfile: works before apt has installed unzip
+  python3 -m zipfile -e "$POOL_ZIP" "$WORK/pool_extract" || die "unzip failed"
+  POOL="$WORK/pool_extract/pool"
+  META=$(ls "$POOL"/coco_with_meta_*.csv 2>/dev/null | head -1)
+  [ -n "$META" ] || die "no coco_with_meta_*.csv inside the pool archive"
+  echo "rebuilding folds with symlinks (deterministic: SEED=42)"
+  python3 "$WORK/pool_extract/tools/lowo_split.py" \
+      --coco "$POOL/_annotations.coco.json" --img-dir "$POOL" \
+      --meta "$META" --out "$WORK/folds" \
+      --test-walls "$TEST_WALLS" --train-only "$TRAIN_ONLY" \
+      --img-mode symlink || die "lowo_split failed"
+  python3 "$REPO_DIR/benchmark/check_folds.py" \
+      --expected "$WORK/pool_extract/folds_summary_expected.json" \
+      --got "$WORK/folds/folds_summary.json" \
+      || die "fold gate FAILED - the pool did not reproduce the frozen split"
 else
-  echo "no $WORK/folds.zip (folds already extracted) — md5 gate skipped"
+  echo "no $POOL_ZIP - setup_v2 will fall back to its gdown path"
 fi
+
+step "B. base bootstrap (setup_v2.sh: GPU gate / deps / HF / dataset verify)"
+bash "$REPO_DIR/setup_v2.sh" || die "setup_v2.sh failed"
 
 step "C. benchmark deps (torch protected — never let pip touch the cu128 wheel)"
 grep -viE '^(torch|torchvision|torchaudio)\b' benchmark/requirements-5090.txt \
