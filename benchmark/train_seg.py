@@ -120,6 +120,9 @@ def main():
     log = open(out / "train_log.csv", "a", encoding="utf-8")
     if log.tell() == 0:
         log.write("step,epoch,total,focal,dice,cldice,lr,sec\n")
+    vlog = open(out / "valid_log.csv", "a", encoding="utf-8")
+    if vlog.tell() == 0:
+        vlog.write("epoch,step,valid_score,best,sec\n")
 
     t0 = time.time()
     model.train()
@@ -155,6 +158,9 @@ def main():
 
         score = validate(model, valid, device)
         print(f"[epoch {epoch}] valid={score:.4f} best={best:.4f} step={step}")
+        vlog.write(f"{epoch},{step},{score:.6f},{max(best, score):.6f},"
+                   f"{time.time() - t0:.0f}\n")
+        vlog.flush()
         if score > best:
             best = score
             torch.save({"model": model.state_dict(), "step": step,

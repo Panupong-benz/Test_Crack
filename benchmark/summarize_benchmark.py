@@ -7,10 +7,22 @@ instance finishes with paper-ready tables before --poweroff; rerunnable
 locally on the returned files, bit-identical.
 
 Outputs (into --results):
-  main_table.csv / main_table.md   rows A1-A6 x (per fold + POOLED);
-                                   columns per Amendment A1 order:
-                                   pixel IoU | F1 | clDice | clIoU_4px |
-                                   marked-FP% | params | ms/tile
+  main_table.md                    human table, cells "median (min-max)"
+  main_table.csv                   NUMERIC twin of the md (one number per
+                                   cell: model,scope,metric,median,min,max,
+                                   n_seeds + params/ms_per_tile on the first
+                                   row of each model) - repo convention:
+                                   intervals are separate columns, never a
+                                   formatted string (Amendment A1.1 item 17)
+  plot_data_long.csv               tidy master for user-made plots: one row
+                                   per (model, fold|POOLED, seed, metric),
+                                   raw unrounded value
+  per_image_metrics.csv            every eval_<tag>.csv row + per-image
+                                   ratios through the same finalize() -
+                                   box plots + worst-image error analysis
+                                   (marked-FP has no per-image level; it is
+                                   accumulated per split only)
+  timing.csv                       job,hours,status from queue_state.json
   a5_vs_a6.csv                     LoRA contribution (delta per metric)
   seed_variance.csv                range per (model, fold, metric)
   summary_all.json                 every number, for downstream scripts
@@ -107,6 +119,54 @@ def run_extras(model: str, fold: str, seed, runs_dir: Path):
     return params, ms
 
 
+PER_IMAGE_COUNTS = ["tp", "fp", "fn", "sp_in_g", "sp", "sg_in_p", "sg",
+                    "cl_tp", "cl_fp", "cl_fn"]
+PER_IMAGE_METRICS = ["pixel_iou", "f1", "cldice", "cliou_4px"]
+
+
+def write_per_image(results: Path, out_csv: Path):
+    """Union of all eval_<tag>.csv rows + per-image ratios through the same
+    finalize() — box plots and worst-image error analysis. marked-FP has no
+    per-image level (accumulated per split only), so it is absent here."""
+    rows = []
+    for f in sorted(results.glob("eval_*.csv")):
+        m = TAG_RE.match(f.stem)
+        if not m or f.name.endswith(".summary.json"):
+            continue
+        model, fold, seed = m.group(1), m.group(2), m.group(3)
+        with open(f, newline="", encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                acc = {k: int(r[k]) for k in PER_IMAGE_COUNTS}
+                mets = finalize(acc)
+                rows.append({"model": model, "fold": fold,
+                             "seed": "" if seed is None else int(seed),
+                             "image": r["image"], **acc,
+                             **{k: mets[k] for k in PER_IMAGE_METRICS}})
+    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["model", "fold", "seed", "image"]
+                           + PER_IMAGE_COUNTS + PER_IMAGE_METRICS)
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
+
+def write_timing(queue_state: Path, out_csv: Path):
+    """queue_state.json ({job: status, job_hours: h}) -> job,hours,status."""
+    rows = []
+    if queue_state.exists():
+        st = json.loads(queue_state.read_text(encoding="utf-8"))
+        for k, v in st.items():
+            if k.endswith("_hours"):
+                continue
+            rows.append({"job": k, "hours": st.get(f"{k}_hours", ""),
+                         "status": v})
+    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["job", "hours", "status"])
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", type=Path, default=Path("results/benchmark"))
@@ -114,6 +174,8 @@ def main(argv=None):
     ap.add_argument("--folds", nargs="+",
                     default=["RW20", "RW20C", "RW20L", "RW20T"])
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    ap.add_argument("--queue-state", type=Path,
+                    default=Path("queue_state.json"))
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 if any expected run is missing")
     ap.add_argument("--selftest", action="store_true")
@@ -127,7 +189,8 @@ def main(argv=None):
         return 1
 
     incomplete = []
-    table_rows = []          # main_table.csv rows
+    table_rows = []          # main_table.csv rows (NUMERIC long format)
+    long_rows = []           # plot_data_long.csv rows (raw values)
     md = ["| model | scope | " + " | ".join(HEADERS)
           + " | params | ms/tile |",
           "|---|---|" + "---|" * (len(HEADERS) + 2)]
@@ -152,6 +215,12 @@ def main(argv=None):
                                       + (f"_s{sd}" if sd is not None else ""))
                     continue
                 per_seed[str(sd)] = {m: s.get(m) for m in METRICS}
+                for metric in METRICS:
+                    if s.get(metric) is not None:
+                        long_rows.append({
+                            "model": model, "label": label, "fold": fold,
+                            "seed": "" if sd is None else sd,
+                            "metric": metric, "value": s[metric]})
             mrec["per_fold"][fold] = per_seed
             for metric in METRICS:
                 vals = [v[metric] for v in per_seed.values()
@@ -171,6 +240,13 @@ def main(argv=None):
                   for fold in args.folds]
             if all(s is not None and "counts" in s for s in ss):
                 pooled_seeds[str(sd)] = pool(ss)
+                for metric in METRICS:
+                    v = pooled_seeds[str(sd)].get(metric)
+                    if v is not None:
+                        long_rows.append({
+                            "model": model, "label": label, "fold": "POOLED",
+                            "seed": "" if sd is None else sd,
+                            "metric": metric, "value": v})
         mrec["pooled"] = pooled_seeds
         all_out["models"][model] = mrec
 
@@ -188,31 +264,45 @@ def main(argv=None):
                     pvals.append(p)
                 if m is not None:
                     msvals.append(m)
-        p_str = f"{statistics.median(pvals) / 1e6:.1f}M" if pvals else "TBD"
-        ms_str = f"{statistics.median(msvals):.1f}" if msvals else "TBD"
+        p_num = statistics.median(pvals) if pvals else ""
+        ms_num = round(statistics.median(msvals), 2) if msvals else ""
+        p_str = f"{p_num / 1e6:.1f}M" if pvals else "TBD"
+        ms_str = f"{ms_num:.1f}" if msvals else "TBD"
 
-        # rows: per fold then POOLED
+        # main_table.csv rows — NUMERIC long format, one row per
+        # (model, scope, metric); intervals as separate columns per the
+        # repo convention (never a formatted "0.42 (0.41-0.44)" string)
+        first_row_of_model = True
+
+        def num_rows(scope, vals_by_metric):
+            nonlocal first_row_of_model
+            for metric in METRICS:
+                vals = vals_by_metric.get(metric, [])
+                if not vals:
+                    continue
+                table_rows.append({
+                    "model": model, "scope": scope, "metric": metric,
+                    "median": statistics.median(vals),
+                    "min": min(vals), "max": max(vals),
+                    "n_seeds": len(vals),
+                    "params": p_num if first_row_of_model else "",
+                    "ms_per_tile": ms_num if first_row_of_model else ""})
+                first_row_of_model = False
+
         for fold in args.folds:
             per_seed = mrec["per_fold"][fold]
-            cells = []
-            for metric in METRICS:
-                vals = [v[metric] for v in per_seed.values()
-                        if v.get(metric) is not None]
-                cells.append(med_range(vals))
-            table_rows.append({"model": model, "scope": fold,
-                               **dict(zip(METRICS, cells))})
-        pcells = []
-        pooled_med = {}
-        for metric in METRICS:
-            vals = [p.get(metric) for p in pooled_seeds.values()
-                    if p.get(metric) is not None]
-            pcells.append(med_range(vals))
-            if vals:
-                pooled_med[metric] = statistics.median(vals)
-        pooled_by_model[model] = pooled_med
-        table_rows.append({"model": model, "scope": "POOLED" + status,
-                           **dict(zip(METRICS, pcells)),
-                           "params": p_str, "ms_per_tile": ms_str})
+            num_rows(fold, {metric: [v[metric] for v in per_seed.values()
+                                     if v.get(metric) is not None]
+                            for metric in METRICS})
+        pooled_vals = {metric: [p.get(metric) for p in pooled_seeds.values()
+                                if p.get(metric) is not None]
+                       for metric in METRICS}
+        num_rows("POOLED", pooled_vals)
+        pooled_by_model[model] = {m: statistics.median(v)
+                                  for m, v in pooled_vals.items() if v}
+
+        # human-facing md keeps the "median (min-max)" cells
+        pcells = [med_range(pooled_vals[m]) for m in METRICS]
         md.append(f"| {label} | POOLED{status} | " + " | ".join(pcells)
                   + f" | {p_str} | {ms_str} |")
 
@@ -225,13 +315,22 @@ def main(argv=None):
     # --- write everything ------------------------------------------------
     out = args.results
     out.mkdir(parents=True, exist_ok=True)
-    fields = ["model", "scope"] + METRICS + ["params", "ms_per_tile"]
+    fields = ["model", "scope", "metric", "median", "min", "max",
+              "n_seeds", "params", "ms_per_tile"]
     with open(out / "main_table.csv", "w", newline="",
               encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(table_rows)
     (out / "main_table.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    with open(out / "plot_data_long.csv", "w", newline="",
+              encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["model", "label", "fold", "seed",
+                                          "metric", "value"])
+        w.writeheader()
+        w.writerows(long_rows)
+    write_per_image(args.results, out / "per_image_metrics.csv")
+    write_timing(args.queue_state, out / "timing.csv")
     with open(out / "a5_vs_a6.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["metric", "a5", "a6", "delta"])
         w.writeheader()
@@ -255,8 +354,9 @@ def main(argv=None):
             return 1
     else:
         print("\nall expected runs present")
-    print(f"wrote main_table.csv/.md, a5_vs_a6.csv, seed_variance.csv, "
-          f"summary_all.json -> {out}")
+    print(f"wrote main_table.csv (numeric)/.md, plot_data_long.csv, "
+          f"per_image_metrics.csv, timing.csv, a5_vs_a6.csv, "
+          f"seed_variance.csv, summary_all.json -> {out}")
     return 0
 
 
@@ -279,6 +379,11 @@ def selftest():
         tag = f"eval_{model}_{fold}" + (f"_s{seed}" if seed is not None
                                         else "")
         (res / f"{tag}.summary.json").write_text(json.dumps(s))
+        with open(res / f"{tag}.csv", "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=["image"] + PER_IMAGE_COUNTS)
+            w.writeheader()
+            w.writerow({"image": "img0.jpg",
+                        **{k: acc[k] for k in PER_IMAGE_COUNTS}})
 
     # a6: seeds x folds, counts chosen so pooled is hand-checkable
     for sd in seeds:
@@ -291,9 +396,11 @@ def selftest():
     keep_models, keep_seedless = MODELS, SEEDLESS
     MODELS = [("a5", "A5"), ("a6", "A6")]
     SEEDLESS = {"a5"}
+    qs = tmp / "queue_state.json"
+    qs.write_text(json.dumps({"a6_F1_s0": "ok", "a6_F1_s0_hours": 2.5}))
     try:
         rc = main(["--results", str(res), "--folds", *folds,
-                   "--seeds", *map(str, seeds)])
+                   "--seeds", *map(str, seeds), "--queue-state", str(qs)])
         assert rc == 0, rc
         allj = json.loads((res / "summary_all.json").read_text())
         pooled = allj["models"]["a6"]["pooled"]["0"]["pixel_iou"]
@@ -305,6 +412,31 @@ def selftest():
         d = next(r for r in rows if r["metric"] == "pixel_iou")
         assert abs(float(d["delta"]) - 0.2) < 1e-12, d
 
+        # numeric twin: every stat cell must parse as a float
+        mt = list(csv.DictReader(open(res / "main_table.csv")))
+        for r in mt:
+            for c in ("median", "min", "max"):
+                float(r[c])                      # raises on formatted strings
+        r6 = next(r for r in mt if r["model"] == "a6"
+                  and r["scope"] == "F1" and r["metric"] == "pixel_iou")
+        assert abs(float(r6["median"]) - 0.8) < 1e-12, r6
+
+        # tidy master: full grid for a6 (2 folds+POOLED) x 2 seeds x metrics
+        pl = list(csv.DictReader(open(res / "plot_data_long.csv")))
+        a6rows = [r for r in pl if r["model"] == "a6"
+                  and r["metric"] == "pixel_iou"]
+        assert len(a6rows) == 3 * 2, a6rows       # (F1,F2,POOLED) x 2 seeds
+        assert all(float(r["value"]) >= 0 for r in pl)
+
+        # per-image ratios come from the same finalize()
+        pi = list(csv.DictReader(open(res / "per_image_metrics.csv")))
+        r = next(r for r in pi if r["model"] == "a6" and r["fold"] == "F1"
+                 and r["seed"] == "0")
+        assert abs(float(r["pixel_iou"]) - 0.8) < 1e-12, r
+
+        tm = list(csv.DictReader(open(res / "timing.csv")))
+        assert tm[0]["job"] == "a6_F1_s0" and float(tm[0]["hours"]) == 2.5
+
         # missing-run case: drop one seed -> INCOMPLETE + strict exit 1
         (res / "eval_a6_F2_s1.summary.json").unlink()
         rc = main(["--results", str(res), "--folds", *folds,
@@ -315,7 +447,8 @@ def selftest():
     finally:
         MODELS, SEEDLESS = keep_models, keep_seedless
     print("selftest PASS: pooled=counts-exact (0.7/0.5), delta 0.2, "
-          "missing run -> INCOMPLETE + strict exit 1")
+          "numeric main_table + tidy long + per-image finalize-exact + "
+          "timing, missing run -> INCOMPLETE + strict exit 1")
     return 0
 
 
