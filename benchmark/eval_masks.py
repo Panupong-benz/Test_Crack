@@ -162,6 +162,8 @@ def run_eval(gt_dir: Path, pred_dir: Path, out_csv: Path,
     summary = finalize(acc)
     summary["n_images"] = len(per_image)
     summary["n_missing_pred"] = len(missing)
+    summary["counts"] = acc          # raw counts -> summarize_benchmark.py
+                                     # pools across folds via the SAME finalize()
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(per_image[0].keys()))

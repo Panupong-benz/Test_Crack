@@ -187,6 +187,12 @@ def main():
         last = add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
                    after=p2)
 
+    # ---- final job: auto-summary -> paper tables before poweroff ---------
+    add("summarize",
+        f"python benchmark/summarize_benchmark.py --results {args.results} "
+        f"--folds {' '.join(args.folds)} "
+        f"--seeds {' '.join(map(str, args.seeds))} --strict", after=last)
+
     args.out.write_text(yaml.safe_dump({"jobs": jobs}, sort_keys=False,
                                        width=1000), encoding="utf-8")
     n_train = sum(1 for j in jobs if j["name"].startswith(

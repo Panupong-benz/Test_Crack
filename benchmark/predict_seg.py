@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -94,13 +95,20 @@ def main():
     img_dir = args.fold / args.split
     imgs = sorted(p for p in img_dir.iterdir() if p.suffix in EXTS)
     args.out.mkdir(parents=True, exist_ok=True)
+    total_sec, total_tiles = 0.0, 0
     for i, p in enumerate(imgs):
         img = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if img is None:
             print(f"[{i+1}/{len(imgs)}] UNREADABLE {p.name}")
             continue
+        h, w = img.shape[:2]
+        n_tiles = (len(tile_starts(max(h, args.tile_size), args.tile_size, stride))
+                   * len(tile_starts(max(w, args.tile_size), args.tile_size, stride)))
+        t0 = time.time()
         mask = predict_image(model, img, device, args.tile_size, stride,
                              args.batch)
+        total_sec += time.time() - t0
+        total_tiles += n_tiles
         cv2.imwrite(str(args.out / f"{p.stem}_mask.png"), mask)
         print(f"[{i+1}/{len(imgs)}] {p.name} -> {p.stem}_mask.png "
               f"({(mask > 0).sum()} px)")
@@ -108,7 +116,9 @@ def main():
         "run": str(args.run), "arch": ck.get("arch"),
         "seed": ck.get("seed"), "n_images": len(imgs),
         "tile_size": args.tile_size, "overlap": args.overlap,
-        "fusion": "mean", "threshold": 0.5}, indent=2))
+        "fusion": "mean", "threshold": 0.5,
+        "ms_per_tile": round(1000.0 * total_sec / max(total_tiles, 1), 2),
+        "n_tiles": total_tiles}, indent=2))
 
 
 if __name__ == "__main__":

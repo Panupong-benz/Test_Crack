@@ -112,6 +112,7 @@ def main():
         print(f"[resume] step={step} epoch={epoch0} best={best:.4f}")
 
     cfg = vars(args) | {"arch_spec": ARCHS[args.arch],
+                        "params": sum(p.numel() for p in model.parameters()),
                         "n_train_tiles": len(train.dataset),
                         "torch": torch.__version__,
                         "gpu": torch.cuda.get_device_name(0)}
