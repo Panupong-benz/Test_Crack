@@ -107,16 +107,19 @@ def pct(v):
 
 
 def run_extras(model: str, fold: str, seed, runs_dir: Path):
-    """params (run.json) + ms/tile (predict_run.json) — TBD when absent."""
+    """params + gflops (run.json), ms/tile (predict_run.json) — TBD when
+    absent (A1/A5/A6 rows: measured manually, declared in A1.2)."""
     tag = f"{model}_{fold}" + (f"_s{seed}" if seed is not None else "")
-    params = ms = None
+    params = gflops = ms = None
     rj = runs_dir / tag / "run.json"
     if rj.exists():
-        params = json.loads(rj.read_text()).get("params")
+        d = json.loads(rj.read_text())
+        params = d.get("params")
+        gflops = d.get("gflops")
     pj = runs_dir / tag / "masks" / "predict_run.json"
     if pj.exists():
         ms = json.loads(pj.read_text()).get("ms_per_tile")
-    return params, ms
+    return params, gflops, ms
 
 
 PER_IMAGE_COUNTS = ["tp", "fp", "fn", "sp_in_g", "sp", "sg_in_p", "sg",
@@ -124,11 +127,16 @@ PER_IMAGE_COUNTS = ["tp", "fp", "fn", "sp_in_g", "sp", "sg_in_p", "sg",
 PER_IMAGE_METRICS = ["pixel_iou", "f1", "cldice", "cliou_4px"]
 
 
-def write_per_image(results: Path, out_csv: Path):
+def write_per_image(results: Path, out_csv: Path, initial_csv: Path):
     """Union of all eval_<tag>.csv rows + per-image ratios through the same
     finalize() — box plots and worst-image error analysis. marked-FP has no
-    per-image level (accumulated per split only), so it is absent here."""
-    rows = []
+    per-image level (accumulated per split only), so it is absent here.
+
+    Also writes initial_fp.csv: rows whose GT is EMPTY (tp+fn==0 and sg==0)
+    = the not-yet-cracked-wall FP baseline of protocol SS4 (E1). If the
+    labeling excluded Initial images from the folds, this file is empty —
+    a loud header-only file, never a silent gap."""
+    rows, initial = [], []
     for f in sorted(results.glob("eval_*.csv")):
         m = TAG_RE.match(f.stem)
         if not m or f.name.endswith(".summary.json"):
@@ -138,16 +146,76 @@ def write_per_image(results: Path, out_csv: Path):
             for r in csv.DictReader(fh):
                 acc = {k: int(r[k]) for k in PER_IMAGE_COUNTS}
                 mets = finalize(acc)
+                px = int(r["px"]) if r.get("px") else ""
                 rows.append({"model": model, "fold": fold,
                              "seed": "" if seed is None else int(seed),
-                             "image": r["image"], **acc,
+                             "image": r["image"], "px": px, **acc,
                              **{k: mets[k] for k in PER_IMAGE_METRICS}})
+                if acc["tp"] + acc["fn"] == 0 and acc["sg"] == 0:
+                    initial.append({
+                        "model": model, "fold": fold,
+                        "seed": "" if seed is None else int(seed),
+                        "image": r["image"], "fp_px": acc["fp"], "px": px,
+                        "fp_rate": (acc["fp"] / px) if px else ""})
     with open(out_csv, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=["model", "fold", "seed", "image"]
+        w = csv.DictWriter(fh, fieldnames=["model", "fold", "seed", "image",
+                                           "px"]
                            + PER_IMAGE_COUNTS + PER_IMAGE_METRICS)
         w.writeheader()
         w.writerows(rows)
+    with open(initial_csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["model", "fold", "seed", "image",
+                                           "fp_px", "px", "fp_rate"])
+        w.writeheader()
+        w.writerows(initial)
+    if not initial:
+        print("initial_fp.csv: EMPTY — no empty-GT images in the test "
+              "splits (Initial photos excluded from folds?)")
     return len(rows)
+
+
+PIXEL_GROUP = ["pixel_iou", "f1"]
+SKEL_GROUP = ["cldice", "cliou_4px"]
+
+
+def write_rank_disagreement(pooled_by_model: dict, out_csv: Path):
+    """Amendment A1 item 4: if the pixel-metric group and the skeleton-metric
+    group rank the models differently, that disagreement is a FINDING to
+    report (SS8al pattern), never smoothed over. Ranks on POOLED medians."""
+    models = [m for m, _ in MODELS if pooled_by_model.get(m)]
+
+    def ranks(metric):
+        vals = {m: pooled_by_model[m][metric] for m in models
+                if pooled_by_model[m].get(metric) is not None}
+        order = sorted(vals, key=lambda m: -vals[m])   # higher = better, all
+        return {m: i + 1 for i, m in enumerate(order)}
+
+    per_metric = {met: ranks(met) for met in PIXEL_GROUP + SKEL_GROUP}
+    rows = []
+    for m in models:
+        row = {"model": m}
+        for met in PIXEL_GROUP + SKEL_GROUP:
+            row[f"rank_{met}"] = per_metric[met].get(m, "")
+        pix = [row[f"rank_{k}"] for k in PIXEL_GROUP
+               if row[f"rank_{k}"] != ""]
+        sk = [row[f"rank_{k}"] for k in SKEL_GROUP if row[f"rank_{k}"] != ""]
+        row["rank_pixel_med"] = statistics.median(pix) if pix else ""
+        row["rank_skel_med"] = statistics.median(sk) if sk else ""
+        row["rank_flip"] = int(bool(pix) and bool(sk)
+                               and row["rank_pixel_med"]
+                               != row["rank_skel_med"])
+        rows.append(row)
+    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["model"]
+                           + [f"rank_{m}" for m in PIXEL_GROUP + SKEL_GROUP]
+                           + ["rank_pixel_med", "rank_skel_med", "rank_flip"])
+        w.writeheader()
+        w.writerows(rows)
+    n_flip = sum(r["rank_flip"] for r in rows)
+    if n_flip:
+        print(f"RANK DISAGREEMENT: {n_flip} model(s) rank differently under "
+              f"pixel vs skeleton metrics — report as a finding (A1 item 4)")
+    return rows
 
 
 def write_timing(queue_state: Path, out_csv: Path):
@@ -256,15 +324,18 @@ def main(argv=None):
             f"  INCOMPLETE ({n_have}/{n_expected} runs)"
 
         # extras: median over the runs that have them
-        pvals, msvals = [], []
+        pvals, gvals, msvals = [], [], []
         for fold in args.folds:
             for sd in seeds:
-                p, m = run_extras(model, fold, sd, args.runs_dir)
+                p, g, m = run_extras(model, fold, sd, args.runs_dir)
                 if p is not None:
                     pvals.append(p)
+                if g is not None:
+                    gvals.append(g)
                 if m is not None:
                     msvals.append(m)
         p_num = statistics.median(pvals) if pvals else ""
+        g_num = statistics.median(gvals) if gvals else ""
         ms_num = round(statistics.median(msvals), 2) if msvals else ""
         p_str = f"{p_num / 1e6:.1f}M" if pvals else "TBD"
         ms_str = f"{ms_num:.1f}" if msvals else "TBD"
@@ -286,6 +357,7 @@ def main(argv=None):
                     "min": min(vals), "max": max(vals),
                     "n_seeds": len(vals),
                     "params": p_num if first_row_of_model else "",
+                    "gflops": g_num if first_row_of_model else "",
                     "ms_per_tile": ms_num if first_row_of_model else ""})
                 first_row_of_model = False
 
@@ -316,7 +388,7 @@ def main(argv=None):
     out = args.results
     out.mkdir(parents=True, exist_ok=True)
     fields = ["model", "scope", "metric", "median", "min", "max",
-              "n_seeds", "params", "ms_per_tile"]
+              "n_seeds", "params", "gflops", "ms_per_tile"]
     with open(out / "main_table.csv", "w", newline="",
               encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -329,8 +401,10 @@ def main(argv=None):
                                           "metric", "value"])
         w.writeheader()
         w.writerows(long_rows)
-    write_per_image(args.results, out / "per_image_metrics.csv")
+    write_per_image(args.results, out / "per_image_metrics.csv",
+                    out / "initial_fp.csv")
     write_timing(args.queue_state, out / "timing.csv")
+    write_rank_disagreement(pooled_by_model, out / "rank_disagreement.csv")
     with open(out / "a5_vs_a6.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["metric", "a5", "a6", "delta"])
         w.writeheader()
@@ -370,27 +444,35 @@ def selftest():
     res.mkdir()
     folds, seeds = ["F1", "F2"], [0, 1]
 
-    def write(model, fold, seed, tp, fp, fn):
+    def write(model, fold, seed, tp, fp, fn, cl=None, extra_rows=()):
+        cl_tp, cl_fp, cl_fn = cl if cl else (tp, fp, fn)
         acc = dict(tp=tp, fp=fp, fn=fn, sp_in_g=tp, sp=tp + fp,
-                   sg_in_p=tp, sg=tp + fn, cl_tp=tp, cl_fp=fp, cl_fn=fn,
-                   marked_fp=0, marked_pixels=0)
+                   sg_in_p=tp, sg=tp + fn, cl_tp=cl_tp, cl_fp=cl_fp,
+                   cl_fn=cl_fn, marked_fp=0, marked_pixels=0)
         s = finalize(acc) | {"counts": acc, "n_images": 1,
                              "n_missing_pred": 0}
         tag = f"eval_{model}_{fold}" + (f"_s{seed}" if seed is not None
                                         else "")
         (res / f"{tag}.summary.json").write_text(json.dumps(s))
         with open(res / f"{tag}.csv", "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=["image"] + PER_IMAGE_COUNTS)
+            w = csv.DictWriter(fh, fieldnames=["image", "px"]
+                               + PER_IMAGE_COUNTS)
             w.writeheader()
-            w.writerow({"image": "img0.jpg",
+            w.writerow({"image": "img0.jpg", "px": 65536,
                         **{k: acc[k] for k in PER_IMAGE_COUNTS}})
+            for r in extra_rows:
+                w.writerow(r)
 
-    # a6: seeds x folds, counts chosen so pooled is hand-checkable
+    # a6: seeds x folds, counts chosen so pooled is hand-checkable;
+    # a5 planted WORSE on pixels but BETTER on clIoU -> rank flip
     for sd in seeds:
-        write("a6", "F1", sd, tp=80, fp=10, fn=10)   # iou 0.8
-        write("a6", "F2", sd, tp=60, fp=20, fn=20)   # iou 0.6
-    write("a5", "F1", None, tp=50, fp=25, fn=25)
-    write("a5", "F2", None, tp=50, fp=25, fn=25)     # iou 0.5 each
+        write("a6", "F1", sd, tp=80, fp=10, fn=10, cl=(30, 35, 35))
+        write("a6", "F2", sd, tp=60, fp=20, fn=20, cl=(30, 35, 35))
+    zero = {k: 0 for k in PER_IMAGE_COUNTS}
+    write("a5", "F1", None, tp=50, fp=25, fn=25, cl=(90, 5, 5),
+          extra_rows=[{"image": "img_init.jpg", "px": 65536,
+                       **zero, "fp": 123}])          # empty-GT image
+    write("a5", "F2", None, tp=50, fp=25, fn=25, cl=(90, 5, 5))
 
     global MODELS, SEEDLESS
     keep_models, keep_seedless = MODELS, SEEDLESS
@@ -437,6 +519,18 @@ def selftest():
         tm = list(csv.DictReader(open(res / "timing.csv")))
         assert tm[0]["job"] == "a6_F1_s0" and float(tm[0]["hours"]) == 2.5
 
+        # planted flip: a5 worse on pixels, better on clIoU
+        rd = list(csv.DictReader(open(res / "rank_disagreement.csv")))
+        assert any(int(r["rank_flip"]) == 1 for r in rd), rd
+        r5 = next(r for r in rd if r["model"] == "a5")
+        assert r5["rank_pixel_iou"] == "2" and r5["rank_cliou_4px"] == "1", r5
+
+        # planted empty-GT image lands in initial_fp with its FP pixels
+        ifp = list(csv.DictReader(open(res / "initial_fp.csv")))
+        assert len(ifp) == 1 and ifp[0]["image"] == "img_init.jpg", ifp
+        assert int(ifp[0]["fp_px"]) == 123, ifp
+        assert abs(float(ifp[0]["fp_rate"]) - 123 / 65536) < 1e-12, ifp
+
         # missing-run case: drop one seed -> INCOMPLETE + strict exit 1
         (res / "eval_a6_F2_s1.summary.json").unlink()
         rc = main(["--results", str(res), "--folds", *folds,
@@ -448,7 +542,8 @@ def selftest():
         MODELS, SEEDLESS = keep_models, keep_seedless
     print("selftest PASS: pooled=counts-exact (0.7/0.5), delta 0.2, "
           "numeric main_table + tidy long + per-image finalize-exact + "
-          "timing, missing run -> INCOMPLETE + strict exit 1")
+          "timing + rank-flip + initial-FP, missing run -> INCOMPLETE + "
+          "strict exit 1")
     return 0
 
 

@@ -111,8 +111,27 @@ def main():
         step, epoch0, best = ck["step"], ck["epoch"], ck["best"]
         print(f"[resume] step={step} epoch={epoch0} best={best:.4f}")
 
+    # GFLOPs at the working tile size (protocol SS3; Amendment A1.2).
+    # thop is optional — absent/failing leaves the cell empty, never crashes.
+    # profiled on a THROWAWAY copy: thop registers total_ops/total_params
+    # buffers on the modules it touches, which would leak into the trained
+    # model's state_dict and break checkpoint round-trips
+    gflops = None
+    try:
+        from thop import profile as _thop_profile
+        _probe = build_model(args.arch).to(device)
+        _macs, _ = _thop_profile(
+            _probe, inputs=(torch.zeros(1, 3, args.tile_size, args.tile_size,
+                                        device=device),), verbose=False)
+        gflops = round(2 * _macs / 1e9, 1)
+        del _probe
+        torch.cuda.empty_cache()
+    except Exception as e:                                    # noqa: BLE001
+        print(f"[gflops] skipped ({type(e).__name__}: {e})")
+
     cfg = vars(args) | {"arch_spec": ARCHS[args.arch],
                         "params": sum(p.numel() for p in model.parameters()),
+                        "gflops": gflops,
                         "n_train_tiles": len(train.dataset),
                         "torch": torch.__version__,
                         "gpu": torch.cuda.get_device_name(0)}

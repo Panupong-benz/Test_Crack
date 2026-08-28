@@ -6,6 +6,7 @@ torch>=2.7.1
 torchvision>=0.22
 bitsandbytes>=0.45.0          # Blackwell support (AdamW8bit for SAM3-LoRA row)
 segmentation-models-pytorch>=0.4.0   # A2 Unet / A3 DeepLabV3Plus / A4 Segformer
+thop>=0.1.1                   # GFLOPs measurement (Amendment A1.2; optional import)
 nnunetv2>=2.5                 # A1
 pycocotools
 opencv-python-headless>=4.10

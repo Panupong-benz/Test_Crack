@@ -122,10 +122,27 @@ def load_gt_masks(gt_dir: Path):
     return by_img
 
 
-def run_eval(gt_dir: Path, pred_dir: Path, out_csv: Path,
-             marked_list: Path | None):
+def load_gt_mask_dir(gt_dir: Path):
+    """image file name -> binary mask, from a directory of GT mask PNGs
+    (axis B external datasets ship PNG masks, not COCO). Any nonzero
+    pixel counts as crack."""
     import cv2
-    gts = load_gt_masks(gt_dir)
+    by_img = {}
+    for p in sorted(gt_dir.iterdir()):
+        if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp"):
+            continue
+        m = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        by_img[p.name] = (m > 0).astype(np.uint8)
+    return by_img
+
+
+def run_eval(gt_dir: Path, pred_dir: Path, out_csv: Path,
+             marked_list: Path | None, gt_mode: str = "coco"):
+    import cv2
+    gts = (load_gt_mask_dir(gt_dir) if gt_mode == "masks"
+           else load_gt_masks(gt_dir))
     marked = set()
     if marked_list and marked_list.exists():
         marked = {l.strip() for l in marked_list.read_text().splitlines()
@@ -148,7 +165,8 @@ def run_eval(gt_dir: Path, pred_dir: Path, out_csv: Path,
                 pred = cv2.resize(pred, (gt.shape[1], gt.shape[0]),
                                   interpolation=cv2.INTER_NEAREST)
         tp, fp, fn = confusion(pred, gt)
-        row = {"image": name, "tp": tp, "fp": fp, "fn": fn}
+        row = {"image": name, "px": int(gt.size),
+               "tp": tp, "fp": fp, "fn": fn}
         row |= cldice_counts(pred, gt)
         row |= cliou_counts(pred, gt)
         for k in ("tp", "fp", "fn", "sp_in_g", "sp", "sg_in_p", "sg",
@@ -215,7 +233,11 @@ def selftest():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gt", type=Path)
+    ap.add_argument("--gt", type=Path,
+                    help="fold split dir with _annotations.coco.json")
+    ap.add_argument("--gt-mask-dir", type=Path, default=None,
+                    help="GT as a dir of mask PNGs (axis B external sets) "
+                         "— alternative to --gt")
     ap.add_argument("--pred", type=Path)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--marked-list", type=Path, default=None)
@@ -223,5 +245,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.selftest:
         selftest()
+    elif a.gt_mask_dir is not None:
+        run_eval(a.gt_mask_dir, a.pred, a.out, a.marked_list,
+                 gt_mode="masks")
     else:
         run_eval(a.gt, a.pred, a.out, a.marked_list)
