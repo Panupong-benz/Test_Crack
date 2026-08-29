@@ -153,8 +153,12 @@ def run_eval(gt_dir: Path, pred_dir: Path, out_csv: Path,
     missing = []
     for name, gt in sorted(gts.items()):
         stem = Path(name).stem
-        cand = [pred_dir / name, pred_dir / f"{stem}.png",
-                pred_dir / f"{stem}_mask.png"]
+        # "_mask.png" FIRST and deliberately: infer_sam writes the binary
+        # prediction as {stem}_mask.png and an RGB matplotlib OVERLAY as
+        # {stem}.png. Preferring the bare stem silently scored the overlay
+        # figure as the prediction on every SAM3 row (Amendment A1.4).
+        cand = [pred_dir / f"{stem}_mask.png", pred_dir / name,
+                pred_dir / f"{stem}.png"]
         pf = next((c for c in cand if c.exists()), None)
         if pf is None:
             missing.append(name)
@@ -227,8 +231,23 @@ def selftest():
     noise[rng.integers(0, 256, 50), rng.integers(0, 256, 50)] = 1
     s = score(noise)
     assert 0.5 < s["pixel_iou"] < 1.0, s
+
+    # PIN THE LOOKUP ORDER (Amendment A1.4). infer_sam writes both
+    # {stem}_mask.png (the binary prediction) and {stem}.png (an RGB overlay
+    # figure); if the bare stem wins, every SAM3 row is scored against a
+    # matplotlib picture and nothing warns.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "IMG.png").write_bytes(b"overlay")       # the decoy figure
+        (d / "IMG_mask.png").write_bytes(b"mask")     # the real prediction
+        stem = "IMG"
+        cand = [d / f"{stem}_mask.png", d / f"{stem}.jpg", d / f"{stem}.png"]
+        pf = next((c for c in cand if c.exists()), None)
+        assert pf is not None and pf.name.endswith("_mask.png"), \
+            f"lookup order regressed: picked {pf}"
     print("selftest PASS: identity=1, empty=0, 2px-shift tolerated by clIoU, "
-          "noise penalized")
+          "noise penalized, _mask.png preferred over the overlay figure")
 
 
 if __name__ == "__main__":

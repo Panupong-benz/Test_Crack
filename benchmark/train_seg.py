@@ -52,6 +52,19 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def _git_sha():
+    """Recorded per run: the instance is destroyed, so 'which code produced
+    this table' has to be answerable from the archive alone."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"],
+                              cwd=str(Path(__file__).resolve().parent),
+                              capture_output=True, text=True,
+                              timeout=20).stdout.strip() or "unknown"
+    except Exception:                                        # noqa: BLE001
+        return "unknown"
+
+
 @torch.no_grad()
 def validate(model, loader, device):
     """Soft clDice-style score on valid split (model-selection only —
@@ -80,7 +93,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--tile-size", type=int, default=1008)
     ap.add_argument("--overlap", type=float, default=0.25)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--max-steps", type=int, default=0,
                     help="hard budget cap in optimizer steps (0 = epochs only)")
@@ -99,7 +112,11 @@ def main():
         args.workers, args.seed)
     model = build_model(args.arch).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scaler = torch.amp.GradScaler("cuda")
+    # No GradScaler: bf16 has fp32's exponent range, so loss scaling is
+    # unnecessary, and its inf-check silently skips the first optimizer steps
+    # (Amendment A1.4). Fixed 1008x1008 input makes cudnn autotuning a pure
+    # win - it is the case benchmark mode exists for.
+    torch.backends.cudnn.benchmark = True
 
     step, epoch0, best = 0, 0, -1.0
     last = out / "last.pt"
@@ -107,7 +124,6 @@ def main():
         ck = torch.load(last, map_location="cpu")
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
-        scaler.load_state_dict(ck["scaler"])
         step, epoch0, best = ck["step"], ck["epoch"], ck["best"]
         print(f"[resume] step={step} epoch={epoch0} best={best:.4f}")
 
@@ -134,6 +150,10 @@ def main():
                         "gflops": gflops,
                         "n_train_tiles": len(train.dataset),
                         "torch": torch.__version__,
+                        "cuda": torch.version.cuda,
+                        "git_sha": _git_sha(),
+                        "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                     time.gmtime()),
                         "gpu": torch.cuda.get_device_name(0)}
     (out / "run.json").write_text(json.dumps(cfg, indent=2))
     log = open(out / "train_log.csv", "a", encoding="utf-8")
@@ -153,9 +173,8 @@ def main():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 loss, parts = composite_loss(model(x), y)
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            loss.backward()
+            opt.step()
             step += 1
 
             if step % 50 == 0:
@@ -166,11 +185,12 @@ def main():
                 log.flush()
             if step % args.save_every == 0:
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                            "scaler": scaler.state_dict(), "step": step,
-                            "epoch": epoch, "best": best}, last)
+                            "step": step, "epoch": epoch, "best": best}, last)
             if args.smoke and step >= args.smoke:
+                vram = torch.cuda.max_memory_allocated() / 2**30
                 print(f"[smoke] {args.smoke} steps in {time.time()-t0:.1f}s "
-                      f"({(time.time()-t0)/args.smoke:.2f} s/step)")
+                      f"({(time.time()-t0)/args.smoke:.2f} s/step), "
+                      f"peak VRAM {vram:.2f} GB at batch {args.batch}")
                 return
             if args.max_steps and step >= args.max_steps:
                 break
@@ -186,13 +206,19 @@ def main():
                         "epoch": epoch, "valid": score,
                         "arch": args.arch, "seed": args.seed}, out / "best.pt")
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "scaler": scaler.state_dict(), "step": step,
-                    "epoch": epoch + 1, "best": best}, last)
+                    "step": step, "epoch": epoch + 1, "best": best}, last)
         if args.max_steps and step >= args.max_steps:
             break
 
+    # peak VRAM is measurable ONLY here; after the instance dies it is gone,
+    # and it is the number that justifies the 5090 (Amendment A1 item 5)
+    hours = (time.time() - t0) / 3600
+    cfg |= {"peak_vram_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+            "hours": round(hours, 3), "steps": step, "best_valid": best,
+            "ended_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    (out / "run.json").write_text(json.dumps(cfg, indent=2))
     (out / "DONE").write_text(f"steps={step} best={best:.4f} "
-                              f"hours={(time.time()-t0)/3600:.2f}")
+                              f"hours={hours:.2f}")
     print(f"[done] best valid {best:.4f}, {(time.time()-t0)/3600:.2f} h")
 
 

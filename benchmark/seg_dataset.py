@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -66,6 +67,21 @@ class SegTileAdapter(Dataset):
                 "tile_idx": idx}
 
 
+def _worker_init(seed: int):
+    """Per-worker RNG seeding. Without this every forked worker inherits ONE
+    numpy state, and tile_dataset's augmentation draws (flip / rotate /
+    jitter) come from global np.random - so all workers emit correlated
+    transforms and the "augmented" batch is far less diverse than it looks.
+    Also makes a seeded run actually reproducible (Amendment A1.4)."""
+    def _init(worker_id: int):
+        import random as _r
+        s = (seed * 100003 + worker_id) % (2 ** 31 - 1)
+        np.random.seed(s)
+        _r.seed(s)
+        torch.manual_seed(s)
+    return _init
+
+
 def build_loaders(data_dir: str, batch_size: int, tile_size: int = 1008,
                   overlap: float = 0.25, num_workers: int = 4, seed: int = 0):
     """Train loader with the production weighted sampler; eval loaders plain."""
@@ -79,13 +95,16 @@ def build_loaders(data_dir: str, batch_size: int, tile_size: int = 1008,
     )
     train = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
                        num_workers=num_workers, pin_memory=True,
-                       drop_last=True)
+                       drop_last=True, persistent_workers=num_workers > 0,
+                       prefetch_factor=4 if num_workers > 0 else None,
+                       worker_init_fn=_worker_init(seed))
 
     def eval_loader(split):
         ds = SegTileAdapter(data_dir, split, tile_size, overlap,
                             augment=False, random_offset=False)
         return DataLoader(ds, batch_size=max(1, batch_size // 2),
                           shuffle=False, num_workers=num_workers,
-                          pin_memory=True)
+                          pin_memory=True,
+                          persistent_workers=num_workers > 0)
 
     return train, eval_loader("valid"), eval_loader("test"), sampler

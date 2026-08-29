@@ -187,11 +187,17 @@ def main():
         last = add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
                    after=p2)
 
-    # ---- final job: auto-summary -> paper tables before poweroff ---------
+    # ---- final jobs: summary tables, then ARCHIVE -----------------------
     add("summarize",
         f"python benchmark/summarize_benchmark.py --results {args.results} "
         f"--folds {' '.join(args.folds)} "
         f"--seeds {' '.join(map(str, args.seeds))} --strict", after=last)
+    # queue_runner --poweroff destroys the box right after the last job, so
+    # the tarball MUST be the last job (Amendment A1.4). optional: a failed
+    # archive must not be the thing that stops us from powering off, and the
+    # runbook tells you to run it by hand if the queue dies earlier.
+    add("collect", "python benchmark/collect_results.py",
+        after="summarize", optional=True)
 
     args.out.write_text(yaml.safe_dump({"jobs": jobs}, sort_keys=False,
                                        width=1000), encoding="utf-8")

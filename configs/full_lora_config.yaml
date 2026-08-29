@@ -108,6 +108,8 @@ training:
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
+  # DEAD: the optimizer is bitsandbytes AdamW8bit and only lr +
+  # weight_decay are passed to it; the betas/eps below are ignored.
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
@@ -115,13 +117,19 @@ training:
 
   num_epochs: 30       # Reduced from 500 (small dataset overfits quickly)
   warmup_steps: 100     # Reduced from 1000 (proportional to dataset size)
+  # DEAD KEYS (verified 2026-08-30, Amendment A1.4): the trainer reads
+  # NEITHER of the next two. A6 trains at a CONSTANT lr with no warmup -
+  # never write "cosine schedule" in a paper on the strength of this file.
   lr_scheduler: "cosine"
 
   logging_steps: 10
+  # DEAD: validation and checkpointing are PER EPOCH in this trainer;
+  # eval_steps / save_steps / save_total_limit / logging_steps are ignored.
   eval_steps: 100       # More frequent validation (from 500)
   save_steps: 100       # More frequent checkpoints (from 1000)
   save_total_limit: 5   # Keep more checkpoints
 
+  # DEAD (but correct by accident): bf16 is hardcoded in the trainer.
   mixed_precision: "bf16"    # Use bfloat16 if available
   seed: 42
   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)

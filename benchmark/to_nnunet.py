@@ -90,7 +90,10 @@ def main():
         cv2.imwrite(str(ds / "imagesTs" / f"{Path(name).stem}_0000.png"), img)
 
     (ds / "dataset.json").write_text(json.dumps({
-        "channel_names": {"0": "RGB"},
+        # 3 entries, not 1: cv2 writes a 3-channel PNG and nnU-Net's
+        # NaturalImage2DIO returns 3 channels, so a single "RGB" key
+        # fails --verify_dataset_integrity (Amendment A1.4)
+        "channel_names": {"0": "R", "1": "G", "2": "B"},
         "labels": {"background": 0, "crack": 1},
         "numTraining": n_tr,
         "file_ending": ".png",

@@ -59,6 +59,9 @@ def cmd_b1(args):
                "--output", out_masks / img.stem,
                "--threshold", args.threshold, "--sliding-window",
                "--tile-size", 1008, "--tile-overlap", 0.25,
+               # without --save-mask infer_sam writes only the overlay figure
+               # and eval_masks would score THAT (Amendment A1.4)
+               "--save-mask",
                "--no-progress", "--weights", args.weights]
         r = run(cmd)
         print(f"[{i + 1}/{len(imgs)}] {img.name}: "

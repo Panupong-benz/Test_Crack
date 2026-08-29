@@ -17,7 +17,10 @@ set -uo pipefail
 # ===================== CONFIG (edit) =====================
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 # v2 config (rank 32) so the smoke gates VRAM at the value the real run will use
-FULL_CONFIG="${FULL_CONFIG:-${REPO_DIR}/configs/full_lora_config_v2.yaml}"
+# MUST match make_jobs.py's --base-config default, or the smoke hour gates
+# VRAM and extrapolates hours for a model the queue never runs (v2 is rank 32
+# / 24 epochs; the benchmark runs rank 16 / 30 epochs). Amendment A1.4.
+FULL_CONFIG="${FULL_CONFIG:-${REPO_DIR}/configs/full_lora_config.yaml}"
 LOWO_ROOT="$(cat /workspace/.lowo_root 2>/dev/null || echo /workspace/folds)"
 SRC_FOLD="${SRC_FOLD:-${LOWO_ROOT}/fold_RW20}" # an existing fold (has train/ valid/ test/)
 SMOKE_DIR="/workspace/smoke"              # scratch dir for the smoke fold + config

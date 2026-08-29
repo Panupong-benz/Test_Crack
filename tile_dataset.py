@@ -11,6 +11,7 @@ Drop-in replacement for COCOSegmentDataset — returns the same Datapoint shape.
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import List, Tuple
@@ -19,6 +20,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image as PILImage
+from PIL import ImageOps as PILImageOps
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import v2
 
@@ -305,13 +307,44 @@ class TiledCOCODataset(Dataset):
 
         info = self.images[img_id]
         path = self.split_dir / info["file_name"]
-        pil = PILImage.open(path).convert("RGB")
+        # exif_transpose is NOT optional. PIL ignores the EXIF orientation
+        # flag; Roboflow (and cv2.imread) apply it, so the COCO width/height
+        # and every annotation live in the ROTATED frame. On the 15 POOL_BM
+        # photos that carry flag 6/8 (RW20C 12, RW20L 1, N20B 2 - all from
+        # the 2026-08 full-res exports) raw PIL returns a landscape array for
+        # a portrait COCO record: tiles were cropped at coordinates from the
+        # other axis and the masks did not match the pixels. Found by
+        # benchmark/check_tile_equivalence.py, 2026-08-30.
+        pil = PILImage.open(path)
+        pil = PILImageOps.exif_transpose(pil).convert("RGB")
         bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        if (bgr.shape[1], bgr.shape[0]) != (info["width"], info["height"]):
+            raise ValueError(
+                f"image/COCO size mismatch for {info['file_name']}: "
+                f"file {bgr.shape[1]}x{bgr.shape[0]} vs COCO "
+                f"{info['width']}x{info['height']} - the annotations cannot "
+                f"be aligned to this image")
 
         self._image_cache[img_id] = bgr
         if len(self._image_cache) > self._image_cache_size:
             self._image_cache.popitem(last=False)
         return bgr
+
+    def _bbox_hits_tile(self, ann, x0: int, y0: int) -> bool:
+        """Does this annotation's COCO bbox intersect the tile rectangle?
+        Returns True when the bbox is missing or degenerate, so an unusual
+        annotation is decoded rather than silently dropped."""
+        if os.environ.get("TILE_DATASET_NO_BBOX_FILTER"):
+            return True                       # equivalence-check escape hatch
+        bb = ann.get("bbox")
+        if not bb or len(bb) != 4:
+            return True
+        bx, by, bw, bh = (float(v) for v in bb)
+        if bw <= 0 or bh <= 0:
+            return True
+        ts = self.tile_size
+        return (bx < x0 + ts and bx + bw > x0 and
+                by < y0 + ts and by + bh > y0)
 
     def _crop_or_pad(self, arr: np.ndarray, x0: int, y0: int, fill: int) -> np.ndarray:
         h, w = arr.shape[:2]
@@ -394,6 +427,17 @@ class TiledCOCODataset(Dataset):
         ann_list = self.img_to_anns.get(img_id, [])
 
         for i, ann in enumerate(ann_list):
+            # BBOX PRE-FILTER (exact, not an approximation): the tile covers
+            # [x0, x0+ts) x [y0, y0+ts) in ORIGINAL image coordinates and the
+            # crop happens before any flip/rotate, so an annotation whose COCO
+            # bbox misses that rectangle can only produce an empty tile_mask,
+            # which the `ys.size == 0` guard below already discards. Skipping
+            # it here avoids a full-frame RLE decode per annotation per tile -
+            # POOL_BM averages ~40 annotations per image at 10-18 MP, so this
+            # was the dominant per-step CPU cost of every trained row.
+            # Equivalence pinned by benchmark/check_tile_equivalence.py.
+            if not self._bbox_hits_tile(ann, x0, y0):
+                continue
             full_mask = self._decode_ann_mask(ann, orig_h, orig_w)
             tile_mask = self._crop_or_pad(full_mask, x0, y0, fill=0)
 

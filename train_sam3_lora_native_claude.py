@@ -967,6 +967,19 @@ class SAM3TrainerNative:
         )
         
     def train(self):
+        # Seed EVERY source of randomness, not just the sampler. Before this
+        # `seed` reached only WeightedDistributedSampler, so LoRA init,
+        # dropout and augmentation were unseeded and the benchmark's "3 seeds
+        # per row" measured something categorically different from the smp
+        # rows (benchmark_protocol Amendment A1 item 3 / A1.4).
+        _seed = int(self.config["training"].get("seed", 42))
+        import random as _random
+        _random.seed(_seed)
+        np.random.seed(_seed)
+        torch.manual_seed(_seed)
+        torch.cuda.manual_seed_all(_seed)
+        print(f"[seed] all RNGs seeded with {_seed}")
+
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
 
@@ -1204,7 +1217,12 @@ class SAM3TrainerNative:
                     )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                    torch.cuda.empty_cache()
+                    # Flushing the allocator every step costs 10-30% and only
+                    # ever mattered on the 4060. Default keeps the old
+                    # behaviour; the 5090 benchmark configs set it false.
+                    if self.config.get("hardware", {}).get(
+                            "empty_cache_every_step", True):
+                        torch.cuda.empty_cache()
 
                 # Track training loss
                 train_losses.append(total_loss.item() * grad_accum_steps)
