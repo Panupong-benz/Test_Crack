@@ -24,7 +24,10 @@ WORK=/workspace
 # folds_summary - a stronger gate than a zip checksum.
 # md5 recorded in benchmark_protocol.md Amendment A1/A1.3.
 POOL_ZIP="${POOL_ZIP:-$WORK/pool_BM.zip}"
-POOLBM_MD5="${POOLBM_MD5:-TBD-at-freeze}"
+# Google Drive file id of pool_BM.zip. Upload the zip to Drive ONCE; every
+# re-rented instance then pulls it in ~1 min instead of re-uploading 1 GB.
+POOL_GDRIVE_ID="${POOL_GDRIVE_ID:-}"
+POOLBM_MD5="${POOLBM_MD5:-d364d0e4f01406b7aadaed385e767663}"   # frozen A1.3
 TEST_WALLS="${TEST_WALLS:-RW20,RW20C,RW20L,RW20T}"
 TRAIN_ONLY="${TRAIN_ONLY:-RW40,N40,N20B}"
 # ==================================================
@@ -35,7 +38,22 @@ step() { echo -e "\n=== $* ==="; }
 step "A. POOL -> folds (runs BEFORE setup_v2 so it finds them and skips gdown)"
 if [ -d "$WORK/folds" ] || ls -d "$WORK"/fold_* >/dev/null 2>&1; then
   echo "folds already present - skipping pool build"
-elif [ -f "$POOL_ZIP" ]; then
+else
+  # fetch the pool if it is not already on disk
+  if [ ! -f "$POOL_ZIP" ] && [ -n "$POOL_GDRIVE_ID" ]; then
+    echo "downloading pool from Google Drive id $POOL_GDRIVE_ID"
+    pip install -q -U gdown
+    gdown --id "$POOL_GDRIVE_ID" -O "$POOL_ZIP" || \
+      die "gdown failed - upload $POOL_ZIP to $WORK via Jupyter/scp and re-run"
+  fi
+  # HARD STOP: without the pool this used to fall through to setup_v2's gdown
+  # of an OLD folds.zip, and check_folds never ran - the whole 177-job queue
+  # would train on the wrong dataset in silence. Never again.
+  [ -f "$POOL_ZIP" ] || die "no $POOL_ZIP and no POOL_GDRIVE_ID set.
+  Upload pool_BM.zip to $WORK (scp/vastai copy/Jupyter) or export
+  POOL_GDRIVE_ID=<drive file id>. Refusing to continue: the legacy folds
+  fallback would silently train on the wrong dataset."
+
   got=$(md5sum "$POOL_ZIP" | cut -d' ' -f1)
   echo "$(basename "$POOL_ZIP") md5 = $got   (expected: $POOLBM_MD5)"
   if [ "$POOLBM_MD5" != "TBD-at-freeze" ] && [ "$got" != "$POOLBM_MD5" ]; then
@@ -58,8 +76,6 @@ elif [ -f "$POOL_ZIP" ]; then
       --expected "$WORK/pool_extract/folds_summary_expected.json" \
       --got "$WORK/folds/folds_summary.json" \
       || die "fold gate FAILED - the pool did not reproduce the frozen split"
-else
-  echo "no $POOL_ZIP - setup_v2 will fall back to its gdown path"
 fi
 
 step "B. base bootstrap (setup_v2.sh: GPU gate / deps / HF / dataset verify)"

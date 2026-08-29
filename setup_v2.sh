@@ -12,7 +12,12 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK=/workspace
-FOLDS_GDRIVE_ID="${FOLDS_GDRIVE_ID:-1wbY5XevwxVM1KtxwLZjaVOLl0Vq6sHq5}"  # override for the NEW folds.zip!
+# DELIBERATELY EMPTY. The July 2-fold folds.zip id used to live here as a
+# default, so a forgotten pool upload silently downloaded the WRONG dataset
+# (setup_benchmark step A then never ran check_folds). Folds now come from
+# pool_BM.zip via setup_benchmark.sh; set this only to resurrect the legacy
+# path on purpose.
+FOLDS_GDRIVE_ID="${FOLDS_GDRIVE_ID:-}"
 FOLDS_ZIP="$WORK/folds.zip"
 
 step() { echo -e "\n=== $* ==="; }
@@ -65,6 +70,10 @@ fi
 step "3. folds.zip"
 if [ ! -d "$WORK/folds" ] && ! ls -d "$WORK"/fold_* >/dev/null 2>&1; then
   if [ ! -f "$FOLDS_ZIP" ]; then
+    [ -n "$FOLDS_GDRIVE_ID" ] || die "no folds and no FOLDS_GDRIVE_ID.
+  For the benchmark run setup_benchmark.sh instead - it builds the folds from
+  pool_BM.zip and gates them with check_folds.py. This legacy path is only for
+  a deliberate re-download of an old folds.zip."
     pip install -q -U gdown
     gdown --id "$FOLDS_GDRIVE_ID" -O "$FOLDS_ZIP" || \
       die "gdown failed - upload folds.zip to $WORK via Jupyter and re-run"
