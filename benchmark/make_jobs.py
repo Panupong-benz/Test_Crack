@@ -32,6 +32,7 @@ import yaml
 
 FOLD_WALLS = ["RW20", "RW20C", "RW20L", "RW20T"]
 SEG_ARCHS = ["unet", "deeplabv3p", "segformer"]
+ALL_ROWS = ["a1", "unet", "deeplabv3p", "segformer", "a5", "a6"]
 
 
 def override_keys(cfg: dict, data_dir: str, seed: int, out_dir: str) -> dict:
@@ -75,7 +76,16 @@ def main():
     ap.add_argument("--marked-list", default="marked_line_images.txt")
     ap.add_argument("--results", default="results/benchmark")
     ap.add_argument("--nnunet-id-base", type=int, default=501)
+    ap.add_argument("--rows", nargs="+", default=ALL_ROWS,
+                    choices=ALL_ROWS, metavar="ROW",
+                    help="which benchmark rows to emit (default: all six). "
+                         "Interim A6-only rental (Amendment A1.8): "
+                         "--rows a6 a5 --seeds 0. Rows left out are SHELVED, "
+                         "not cancelled - a later rental adds them with the "
+                         "same pool/folds and the eval CSVs merge in results/.")
     args = ap.parse_args()
+    rows = set(args.rows)
+    seg_rows = [a for a in SEG_ARCHS if a in rows]
 
     base_cfg = yaml.safe_load(args.base_config.read_text(encoding="utf-8"))
     args.config_dir.mkdir(parents=True, exist_ok=True)
@@ -103,9 +113,9 @@ def main():
                 f"--out {args.results}/{out} "
                 f"--marked-list {args.marked_list}")
 
-    # ---- Phase 4a: smoke (eval unit test + 50-step per arch) -------------
+    # ---- Phase 4a: smoke (eval unit test + 50-step per SELECTED arch) ----
     prev = add("smoke_eval_unit", "python benchmark/eval_masks.py --selftest")
-    for arch in SEG_ARCHS:
+    for arch in seg_rows:
         prev = add(f"smoke_{arch}",
                    f"python benchmark/train_seg.py --arch {arch} "
                    f"--data {args.data_root}/fold_{args.folds[0]} "
@@ -116,13 +126,18 @@ def main():
     # tail here on 3 images off the 50-step probe checkpoint - the numbers are
     # meaningless, the pipe is what is under test. Spelled exactly like the
     # real jobs below so the smoke tests the same command, not a similar one.
-    prev = add("smoke_predict",
-               f"python benchmark/predict_seg.py --run runs/smoke_{SEG_ARCHS[0]} "
-               f"--fold {args.data_root}/fold_{args.folds[0]} "
-               f"--out runs/smoke_{SEG_ARCHS[0]}/masks --limit 3", after=prev)
-    prev = add("smoke_eval_real",
-               eval_cmd(args.folds[0], f"runs/smoke_{SEG_ARCHS[0]}/masks",
-                        "smoke", out_name="smoke_eval.csv"), after=prev)
+    # (Only when a seg row is selected at all - an A6-only queue has no
+    # predict_seg jobs to protect.)
+    if seg_rows:
+        prev = add("smoke_predict",
+                   f"python benchmark/predict_seg.py "
+                   f"--run runs/smoke_{seg_rows[0]} "
+                   f"--fold {args.data_root}/fold_{args.folds[0]} "
+                   f"--out runs/smoke_{seg_rows[0]}/masks --limit 3",
+                   after=prev)
+        prev = add("smoke_eval_real",
+                   eval_cmd(args.folds[0], f"runs/smoke_{seg_rows[0]}/masks",
+                            "smoke", out_name="smoke_eval.csv"), after=prev)
 
     # ---- A6 SAM3-LoRA: kill-gate run first, then the rest ----------------
     def a6_jobs(fold, seed, after, gate=False):
@@ -148,31 +163,34 @@ def main():
                 after=i, optional=not gate)
         return e if gate else t
 
-    gate = a6_jobs(args.folds[0], args.seeds[0], prev, gate=True)
-    # GATE: queue_runner stops here automatically if the gate run fails;
-    # the clDice-vs-old-checkpoint judgement (runbook 4b) is a manual read
-    # of eval_a6_<fold0>_s0 before letting the queue continue overnight.
-    last = gate
-    for fold in args.folds:
-        for seed in args.seeds:
-            if fold == args.folds[0] and seed == args.seeds[0]:
-                continue
-            last = a6_jobs(fold, seed, last)
+    last = prev
+    if "a6" in rows:
+        gate = a6_jobs(args.folds[0], args.seeds[0], prev, gate=True)
+        # GATE: queue_runner stops here automatically if the gate run fails;
+        # the clDice-vs-old-checkpoint judgement (runbook 4b) is a manual read
+        # of eval_a6_<fold0>_s0 before letting the queue continue overnight.
+        last = gate
+        for fold in args.folds:
+            for seed in args.seeds:
+                if fold == args.folds[0] and seed == args.seeds[0]:
+                    continue
+                last = a6_jobs(fold, seed, last)
 
     # ---- A5 zero-shot (no training; cheap, right after the gate) ---------
     # no training here, so these are leaves off the last A6 train: one failed
     # zero-shot fold costs its own row and nothing else. `last` is deliberately
     # NOT advanced, so the A2-A4 block still chains to a training job.
-    for fold in args.folds:
-        tag = f"a5_{fold}"
-        i = add(tag, f"python benchmark/run_a5_zeroshot.py "
-                     f"--fold {args.data_root}/fold_{fold} "
-                     f"--out runs/{tag}/masks", after=last, optional=True)
-        add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
-            after=i, optional=True)
+    if "a5" in rows:
+        for fold in args.folds:
+            tag = f"a5_{fold}"
+            i = add(tag, f"python benchmark/run_a5_zeroshot.py "
+                         f"--fold {args.data_root}/fold_{fold} "
+                         f"--out runs/{tag}/masks", after=last, optional=True)
+            add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
+                after=i, optional=True)
 
     # ---- A2/A3/A4 --------------------------------------------------------
-    for arch in SEG_ARCHS:
+    for arch in seg_rows:
         for fold in args.folds:
             for seed in args.seeds:
                 tag = f"{arch}_{fold}_s{seed}"
@@ -196,7 +214,7 @@ def main():
                 last = t
 
     # ---- A1 nnU-Net (per fold; seed policy decided at smoke hour) --------
-    for k, fold in enumerate(args.folds):
+    for k, fold in enumerate(args.folds if "a1" in rows else []):
         did = args.nnunet_id_base + k
         name = f"BM_{fold}"
         tag = f"a1_{fold}"
@@ -249,7 +267,9 @@ def main():
     add("summarize",
         f"python benchmark/summarize_benchmark.py --results {args.results} "
         f"--folds {' '.join(args.folds)} "
-        f"--seeds {' '.join(map(str, args.seeds))} --strict", after=last,
+        f"--seeds {' '.join(map(str, args.seeds))} "
+        f"--models {' '.join(r for r in ALL_ROWS if r in rows)} "
+        f"--strict", after=last,
         optional=True)
     # queue_runner --poweroff destroys the box right after the last job, so
     # the tarball MUST be the last job (Amendment A1.4) and it carries NO
@@ -264,7 +284,8 @@ def main():
     n_train = sum(1 for j in jobs if j["name"].startswith(
         ("a6_", "unet_", "deeplabv3p_", "segformer_", "a1_")))
     print(f"{args.out}: {len(jobs)} jobs ({n_train} training runs, "
-          f"{len(args.folds)} folds x seeds {args.seeds})")
+          f"{len(args.folds)} folds x seeds {args.seeds}, "
+          f"rows {sorted(rows)})")
     print(f"A6 configs -> {args.config_dir}/  (data_dir/seed/output_dir "
           f"overridden; everything else = base config)")
 

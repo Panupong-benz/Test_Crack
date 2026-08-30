@@ -302,6 +302,14 @@ def main(argv=None):
                     default=Path("queue_state.json"))
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 if any expected run is missing")
+    ap.add_argument("--models", nargs="+", default=None,
+                    metavar="MODEL",
+                    help="rows to expect and summarize (default: all six). "
+                         "make_jobs passes the rows it actually queued, so "
+                         "an interim A6-only rental (Amendment A1.8) is not "
+                         "flagged INCOMPLETE for baselines that were shelved "
+                         "on purpose - while a genuinely missing a6 run "
+                         "still is.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:
@@ -323,7 +331,10 @@ def main(argv=None):
     seed_var_rows = []
     pooled_by_model = {}     # model -> {metric: median-over-seeds float}
 
+    wanted = set(args.models) if args.models else None
     for model, label in MODELS:
+        if wanted is not None and model not in wanted:
+            continue
         seeds = [None] if model in SEEDLESS else args.seeds
         mrec = {"label": label, "per_fold": {}, "pooled": {}}
 
@@ -655,12 +666,27 @@ def selftest():
         assert rc == 1, "strict must fail on a missing run"
         allj = json.loads((res / "summary_all.json").read_text())
         assert "a6_F2_s1" in allj["incomplete"], allj["incomplete"]
+
+        # --models: a shelved row is not INCOMPLETE, a selected one still is.
+        # Same on-disk state (a6_F2_s1 deleted): expecting only a5 -> clean
+        # strict pass; expecting a6 -> the hole is still caught.
+        rc = main(["--results", str(res), "--folds", *folds,
+                   "--seeds", *map(str, seeds), "--models", "a5", "--strict"])
+        assert rc == 0, "shelved a6 must not fail an a5-only summary"
+        allj = json.loads((res / "summary_all.json").read_text())
+        assert allj["incomplete"] == [], allj["incomplete"]
+        mt4 = list(csv.DictReader(open(res / "main_table.csv")))
+        assert {r["model"] for r in mt4} == {"a5"}, mt4
+        rc = main(["--results", str(res), "--folds", *folds,
+                   "--seeds", *map(str, seeds), "--models", "a6", "--strict"])
+        assert rc == 1, "a selected row with a missing run must still fail"
     finally:
         MODELS, SEEDLESS = keep_models, keep_seedless
     print("selftest PASS: pooled=counts-exact (0.7/0.5), delta 0.2, "
           "numeric main_table + tidy long + per-image finalize-exact + "
           "timing + rank-flip + initial-FP + axis_b kept out of "
           "main_table + budget-limited mark (md label, csv column, "
+          "--models shelved-vs-selected INCOMPLETE, "
           "numeric cells intact), missing run -> INCOMPLETE + "
           "strict exit 1")
     return 0

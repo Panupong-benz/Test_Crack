@@ -1,0 +1,14 @@
+# A6-only smoke ladder (Amendment A1.8) — the interim rental trains only our
+# SAM3-LoRA, whose batch is FIXED in the config (micro 2 x accum 8), so there
+# is no batch sweep: the smoke's whole job is to prove the pipe and print the
+# s/step that the runbook's hour formula consumes before the queue is released.
+#   bash run_benchmark.sh smoke-a6
+# The full 4a ladder (jobs_template.yaml) stays for the shelved baseline grid.
+jobs:
+  - name: smoke_eval_unit
+    cmd: python benchmark/eval_masks.py --selftest
+  # tiny-fold 1-epoch probe through the SAME config the queue trains with
+  # (A1.4 item: FULL_CONFIG == make_jobs --base-config default)
+  - name: smoke_sam3
+    after: smoke_eval_unit
+    cmd: bash smoke_test.sh

@@ -18,6 +18,12 @@ case "$MODE" in
   smoke)
     python benchmark/queue_runner.py --jobs benchmark/jobs_template.yaml
     ;;
+  smoke-a6)
+    # interim A6-only rental (Amendment A1.8): no seg-arch batch sweep -
+    # A6's batch is fixed in the config, so the smoke only proves the pipe
+    # and prints the s/step for the runbook hour formula (~15 min)
+    python benchmark/queue_runner.py --jobs benchmark/jobs_template_a6.yaml
+    ;;
   full)
     if [ ! -f jobs.yaml ]; then
       echo "jobs.yaml missing — generate it with the smoke-hour batch size:"
@@ -27,5 +33,5 @@ case "$MODE" in
     python benchmark/queue_runner.py --jobs jobs.yaml --poweroff
     ;;
   *)
-    echo "usage: $0 smoke|full"; exit 2 ;;
+    echo "usage: $0 smoke|smoke-a6|full"; exit 2 ;;
 esac
