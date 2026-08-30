@@ -26,7 +26,10 @@ WORK=/workspace
 POOL_ZIP="${POOL_ZIP:-$WORK/pool_BM.zip}"
 # Google Drive file id of pool_BM.zip. Upload the zip to Drive ONCE; every
 # re-rented instance then pulls it in ~1 min instead of re-uploading 1 GB.
-POOL_GDRIVE_ID="${POOL_GDRIVE_ID:-}"
+# Baked in 2026-08-30 (Amendment A1.6); override with the env var if the
+# file is re-uploaded. The share must be "anyone with the link" or gdown
+# saves an HTML permission page - the size gate below catches that.
+POOL_GDRIVE_ID="${POOL_GDRIVE_ID:-1iQz5PEGIYBm7y50V3N3oqUmKgGyKU_s3}"
 POOLBM_MD5="${POOLBM_MD5:-d364d0e4f01406b7aadaed385e767663}"   # frozen A1.3
 TEST_WALLS="${TEST_WALLS:-RW20,RW20C,RW20L,RW20T}"
 TRAIN_ONLY="${TRAIN_ONLY:-RW40,N40,N20B}"
@@ -43,17 +46,31 @@ else
   if [ ! -f "$POOL_ZIP" ] && [ -n "$POOL_GDRIVE_ID" ]; then
     echo "downloading pool from Google Drive id $POOL_GDRIVE_ID"
     pip install -q -U gdown
-    gdown --id "$POOL_GDRIVE_ID" -O "$POOL_ZIP" || \
+    # NOT `gdown --id`: that flag was REMOVED in gdown 5.x and the pip
+    # line above always installs the newest one. uc?id= works on every
+    # version; --fuzzy on the share URL is the fallback.
+    gdown "https://drive.google.com/uc?id=$POOL_GDRIVE_ID" -O "$POOL_ZIP" || \
+      gdown --fuzzy "https://drive.google.com/file/d/$POOL_GDRIVE_ID/view" -O "$POOL_ZIP" || \
       die "gdown failed - upload $POOL_ZIP to $WORK via Jupyter/scp and re-run"
   fi
   # HARD STOP: without the pool this used to fall through to setup_v2's gdown
-  # of an OLD folds.zip, and check_folds never ran - the whole 177-job queue
+  # of an OLD folds.zip, and check_folds never ran - the whole 181-job queue
   # would train on the wrong dataset in silence. Never again.
   [ -f "$POOL_ZIP" ] || die "no $POOL_ZIP and no POOL_GDRIVE_ID set.
   Upload pool_BM.zip to $WORK (scp/vastai copy/Jupyter) or export
   POOL_GDRIVE_ID=<drive file id>. Refusing to continue: the legacy folds
   fallback would silently train on the wrong dataset."
 
+  # A 1 GB file goes through Drive's virus-scan interstitial. If sharing
+  # is not "anyone with the link", gdown saves that HTML page AS the zip
+  # and the md5 gate below then fails pointing at the wrong problem.
+  bytes=$(stat -c%s "$POOL_ZIP" 2>/dev/null || echo 0)
+  if [ "$bytes" -lt 100000000 ]; then
+    echo "--- first 200 bytes of $POOL_ZIP ---"; head -c 200 "$POOL_ZIP"; echo
+    die "$POOL_ZIP is only $bytes bytes (expected ~1064 MB).
+  Almost always a Drive permission page, not a zip: set the file sharing
+  to 'Anyone with the link' and re-run, or upload it by hand to $WORK."
+  fi
   got=$(md5sum "$POOL_ZIP" | cut -d' ' -f1)
   echo "$(basename "$POOL_ZIP") md5 = $got   (expected: $POOLBM_MD5)"
   if [ "$POOLBM_MD5" != "TBD-at-freeze" ] && [ "$got" != "$POOLBM_MD5" ]; then

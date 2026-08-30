@@ -33,7 +33,7 @@ jobs:
     after: smoke_predict
     cmd: python benchmark/eval_masks.py --gt data/fold_RW20/test
          --pred runs/smoke_unet/masks
-         --out results/benchmark/eval_smoke.csv
+         --out results/benchmark/smoke_eval.csv
          --marked-list marked_line_images.txt
 
   # SAM3-LoRA smoke: tiny-fold 1-epoch probe via the existing script

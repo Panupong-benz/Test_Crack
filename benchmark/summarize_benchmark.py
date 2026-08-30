@@ -178,6 +178,42 @@ PIXEL_GROUP = ["pixel_iou", "f1"]
 SKEL_GROUP = ["cldice", "cliou_4px"]
 
 
+def write_axis_b(results: Path, pooled_by_model: dict, out_csv: Path):
+    """Axis B rows, kept in their OWN table on purpose.
+
+    protocol SS5 forbids merging these into main_table: B1 scores our
+    checkpoint on PUBLIC crack photos and B2 scores a public model on OUR
+    pen-traced walls - different data, so a shared column would be a category
+    error. (main_table is safe by construction: TAG_RE parses eval_b1_* /
+    eval_b2_* fine, but MODELS has no b1/b2 entry, so they never enter it.)
+
+    The A-row pooled marked-FP is carried alongside because P-B2 is judged
+    exactly that way: "marked-FP% worse than every domain-trained A row".
+    Written even when empty, so an absent axis B is visible as an empty table
+    rather than a missing file."""
+    rows = []
+    for f in sorted(results.glob("eval_b[12]_*.summary.json")):
+        tag = f.stem.replace(".summary", "")
+        kind, target = tag.split("_")[1], "_".join(tag.split("_")[2:])
+        s = json.loads(f.read_text(encoding="utf-8"))
+        row = {"direction": kind, "target": target,
+               "n_images": s.get("n_images", "")}
+        for m in METRICS:
+            row[m] = s.get(m)
+        rows.append(row)
+    ref = {f"A_{m}_marked_fp_rate": pooled_by_model.get(m, {}).get(
+        "marked_fp_rate") for m, _ in MODELS}
+    for r in rows:
+        r.update(ref if r["direction"] == "b2" else
+                 {k: "" for k in ref})
+    fields = (["direction", "target", "n_images"] + METRICS + sorted(ref))
+    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    return rows
+
+
 def write_rank_disagreement(pooled_by_model: dict, out_csv: Path):
     """Amendment A1 item 4: if the pixel-metric group and the skeleton-metric
     group rank the models differently, that disagreement is a FINDING to
@@ -405,6 +441,8 @@ def main(argv=None):
                     out / "initial_fp.csv")
     write_timing(args.queue_state, out / "timing.csv")
     write_rank_disagreement(pooled_by_model, out / "rank_disagreement.csv")
+    b_rows = write_axis_b(args.results, pooled_by_model, out / "axis_b.csv")
+    all_out["axis_b_rows"] = len(b_rows)
     with open(out / "a5_vs_a6.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["metric", "a5", "a6", "delta"])
         w.writeheader()
@@ -444,11 +482,14 @@ def selftest():
     res.mkdir()
     folds, seeds = ["F1", "F2"], [0, 1]
 
-    def write(model, fold, seed, tp, fp, fn, cl=None, extra_rows=()):
+    def write(model, fold, seed, tp, fp, fn, cl=None, extra_rows=(),
+              marked=(0, 0)):
+        # marked=(fp, pixels): finalize() omits marked_fp_rate when pixels is
+        # 0, so the axis-B carry-across can only be tested with real values
         cl_tp, cl_fp, cl_fn = cl if cl else (tp, fp, fn)
         acc = dict(tp=tp, fp=fp, fn=fn, sp_in_g=tp, sp=tp + fp,
                    sg_in_p=tp, sg=tp + fn, cl_tp=cl_tp, cl_fp=cl_fp,
-                   cl_fn=cl_fn, marked_fp=0, marked_pixels=0)
+                   cl_fn=cl_fn, marked_fp=marked[0], marked_pixels=marked[1])
         s = finalize(acc) | {"counts": acc, "n_images": 1,
                              "n_missing_pred": 0}
         tag = f"eval_{model}_{fold}" + (f"_s{seed}" if seed is not None
@@ -466,8 +507,10 @@ def selftest():
     # a6: seeds x folds, counts chosen so pooled is hand-checkable;
     # a5 planted WORSE on pixels but BETTER on clIoU -> rank flip
     for sd in seeds:
-        write("a6", "F1", sd, tp=80, fp=10, fn=10, cl=(30, 35, 35))
-        write("a6", "F2", sd, tp=60, fp=20, fn=20, cl=(30, 35, 35))
+        write("a6", "F1", sd, tp=80, fp=10, fn=10, cl=(30, 35, 35),
+              marked=(2, 100))
+        write("a6", "F2", sd, tp=60, fp=20, fn=20, cl=(30, 35, 35),
+              marked=(2, 100))
     zero = {k: 0 for k in PER_IMAGE_COUNTS}
     write("a5", "F1", None, tp=50, fp=25, fn=25, cl=(90, 5, 5),
           extra_rows=[{"image": "img_init.jpg", "px": 65536,
@@ -531,6 +574,31 @@ def selftest():
         assert int(ifp[0]["fp_px"]) == 123, ifp
         assert abs(float(ifp[0]["fp_rate"]) - 123 / 65536) < 1e-12, ifp
 
+        # axis B: its own table, and it must NOT leak into main_table
+        for tag, n in (("eval_b1_road420", 7), ("eval_b2_F1", 3)):
+            acc = dict(tp=1, fp=1, fn=1, sp_in_g=1, sp=2, sg_in_p=1, sg=2,
+                       cl_tp=1, cl_fp=1, cl_fn=1, marked_fp=5,
+                       marked_pixels=100)
+            (res / f"{tag}.summary.json").write_text(json.dumps(
+                finalize(acc) | {"counts": acc, "n_images": n,
+                                 "n_missing_pred": 0}))
+        main(["--results", str(res), "--folds", *folds,
+              "--seeds", *map(str, seeds)])
+        ab = list(csv.DictReader(open(res / "axis_b.csv")))
+        assert {r["direction"] for r in ab} == {"b1", "b2"}, ab
+        assert {r["target"] for r in ab} == {"road420", "F1"}, ab
+        b2row = next(r for r in ab if r["direction"] == "b2")
+        assert b2row["A_a6_marked_fp_rate"] != "", (
+            "P-B2 is judged against the A rows' marked-FP - carry it here")
+        b1row = next(r for r in ab if r["direction"] == "b1")
+        assert b1row["A_a6_marked_fp_rate"] == "", (
+            "B1 scores PUBLIC photos; our marked-line list is meaningless there")
+        mt2 = list(csv.DictReader(open(res / "main_table.csv")))
+        assert not [r for r in mt2 if r["model"] in ("b1", "b2")], (
+            "axis B must never enter main_table (protocol SS5)")
+        for tag in ("eval_b1_road420", "eval_b2_F1"):
+            (res / f"{tag}.summary.json").unlink()
+
         # missing-run case: drop one seed -> INCOMPLETE + strict exit 1
         (res / "eval_a6_F2_s1.summary.json").unlink()
         rc = main(["--results", str(res), "--folds", *folds,
@@ -542,7 +610,8 @@ def selftest():
         MODELS, SEEDLESS = keep_models, keep_seedless
     print("selftest PASS: pooled=counts-exact (0.7/0.5), delta 0.2, "
           "numeric main_table + tidy long + per-image finalize-exact + "
-          "timing + rank-flip + initial-FP, missing run -> INCOMPLETE + "
+          "timing + rank-flip + initial-FP + axis_b kept out of "
+          "main_table, missing run -> INCOMPLETE + "
           "strict exit 1")
     return 0
 

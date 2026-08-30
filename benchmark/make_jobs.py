@@ -92,11 +92,15 @@ def main():
         jobs.append(j)
         return name
 
-    def eval_cmd(fold, pred_dir, tag):
+    def eval_cmd(fold, pred_dir, tag, out_name=None):
+        # out_name overrides the eval_<tag>.csv convention. summarize_benchmark
+        # globs eval_*.summary.json, so the SMOKE eval must not use it or every
+        # real run would carry a "WARN: unrecognized tag eval_smoke" line.
+        out = out_name or f"eval_{tag}.csv"
         return (f"python benchmark/eval_masks.py "
                 f"--gt {args.data_root}/fold_{fold}/test "
                 f"--pred {pred_dir} "
-                f"--out {args.results}/eval_{tag}.csv "
+                f"--out {args.results}/{out} "
                 f"--marked-list {args.marked_list}")
 
     # ---- Phase 4a: smoke (eval unit test + 50-step per arch) -------------
@@ -118,7 +122,7 @@ def main():
                f"--out runs/smoke_{SEG_ARCHS[0]}/masks --limit 3", after=prev)
     prev = add("smoke_eval_real",
                eval_cmd(args.folds[0], f"runs/smoke_{SEG_ARCHS[0]}/masks",
-                        "smoke"), after=prev)
+                        "smoke", out_name="smoke_eval.csv"), after=prev)
 
     # ---- A6 SAM3-LoRA: kill-gate run first, then the rest ----------------
     def a6_jobs(fold, seed, after, gate=False):
@@ -215,6 +219,18 @@ def main():
         last = t
 
     # ---- final jobs: summary tables, then ARCHIVE -----------------------
+    # ---- Axis B (external transfer, both directions) ---------------------
+    # ONE optional job that discovers whatever external data was downloaded
+    # onto the instance and skips the rest (Amendment A1.6). Before this, axis
+    # B was not in the queue at all and ran only if someone remembered eight
+    # commands by hand; now downloading the data is enough, and not
+    # downloading it costs nothing but a recorded skip in axis_b_auto.json.
+    add("axis_b",
+        f"python benchmark/axis_b.py auto --data-root {args.data_root} "
+        f"--folds {' '.join(args.folds)} "
+        f"--marked-list {args.marked_list} --results {args.results}",
+        after=last, optional=True)
+
     # optional BY DESIGN: --strict exits 1 when a run is missing, which is
     # exactly what happens once any optional leaf was skipped. summarize
     # regenerates bit-identically on the local machine from the eval CSVs
