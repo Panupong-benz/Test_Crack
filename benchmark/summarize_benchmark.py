@@ -178,6 +178,26 @@ PIXEL_GROUP = ["pixel_iou", "f1"]
 SKEL_GROUP = ["cldice", "cliou_4px"]
 
 
+def load_budget_limited(results: Path) -> dict:
+    """{model: "k/n"} for rows that hit their epoch ceiling, from
+    epoch_saturation.csv (written by benchmark/epoch_saturation.py against a
+    criterion pre-registered in that file's docstring).
+
+    The mark belongs IN the table: a footnote is not what a reader remembers,
+    and a row that was still improving when its budget ran out is reporting a
+    lower bound, not a score. Absent file = no marks, silently: the saturation
+    job is optional and the table must still build without it."""
+    fp = results / "epoch_saturation.csv"
+    if not fp.exists():
+        return {}
+    tally = {}
+    with open(fp, encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            n, k = tally.get(r["model"], (0, 0))
+            tally[r["model"]] = (n + 1, k + (r["verdict"] == "budget_limited"))
+    return {m: f"{k}/{n}" for m, (n, k) in tally.items() if k}
+
+
 def write_axis_b(results: Path, pooled_by_model: dict, out_csv: Path):
     """Axis B rows, kept in their OWN table on purpose.
 
@@ -293,6 +313,7 @@ def main(argv=None):
         return 1
 
     incomplete = []
+    budget_limited = load_budget_limited(args.results)
     table_rows = []          # main_table.csv rows (NUMERIC long format)
     long_rows = []           # plot_data_long.csv rows (raw values)
     md = ["| model | scope | " + " | ".join(HEADERS)
@@ -394,7 +415,8 @@ def main(argv=None):
                     "n_seeds": len(vals),
                     "params": p_num if first_row_of_model else "",
                     "gflops": g_num if first_row_of_model else "",
-                    "ms_per_tile": ms_num if first_row_of_model else ""})
+                    "ms_per_tile": ms_num if first_row_of_model else "",
+                    "budget_limited": budget_limited.get(model, "")})
                 first_row_of_model = False
 
         for fold in args.folds:
@@ -411,7 +433,9 @@ def main(argv=None):
 
         # human-facing md keeps the "median (min-max)" cells
         pcells = [med_range(pooled_vals[m]) for m in METRICS]
-        md.append(f"| {label} | POOLED{status} | " + " | ".join(pcells)
+        bl = budget_limited.get(model)
+        label_md = f"{label} (budget-limited {bl})" if bl else label
+        md.append(f"| {label_md} | POOLED{status} | " + " | ".join(pcells)
                   + f" | {p_str} | {ms_str} |")
 
     # --- A5 vs A6 (LoRA contribution) -----------------------------------
@@ -424,7 +448,7 @@ def main(argv=None):
     out = args.results
     out.mkdir(parents=True, exist_ok=True)
     fields = ["model", "scope", "metric", "median", "min", "max",
-              "n_seeds", "params", "gflops", "ms_per_tile"]
+              "n_seeds", "params", "gflops", "ms_per_tile", "budget_limited"]
     with open(out / "main_table.csv", "w", newline="",
               encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -454,6 +478,7 @@ def main(argv=None):
         w.writeheader()
         w.writerows(seed_var_rows)
     all_out["incomplete"] = incomplete
+    all_out["budget_limited"] = budget_limited
     (out / "summary_all.json").write_text(json.dumps(all_out, indent=2),
                                           encoding="utf-8")
 
@@ -574,6 +599,30 @@ def selftest():
         assert int(ifp[0]["fp_px"]) == 123, ifp
         assert abs(float(ifp[0]["fp_rate"]) - 123 / 65536) < 1e-12, ifp
 
+        # budget-limited marking: visible in the md, a COLUMN in the csv,
+        # and the numeric cells must survive (make_bench_figs floats them)
+        with open(res / "epoch_saturation.csv", "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=["run", "model", "verdict"])
+            w.writeheader()
+            w.writerow({"run": "a6_F1_s0", "model": "a6",
+                        "verdict": "budget_limited"})
+            w.writerow({"run": "a6_F2_s0", "model": "a6",
+                        "verdict": "saturated"})
+            w.writerow({"run": "a5_F1", "model": "a5", "verdict": "saturated"})
+        main(["--results", str(res), "--folds", *folds,
+              "--seeds", *map(str, seeds)])
+        mt3 = list(csv.DictReader(open(res / "main_table.csv")))
+        a6r = [r for r in mt3 if r["model"] == "a6"]
+        assert a6r and all(r["budget_limited"] == "1/2" for r in a6r), a6r
+        assert all(r["budget_limited"] == "" for r in mt3
+                   if r["model"] == "a5"), "a5 had no budget_limited run"
+        for r in mt3:                    # the guard that matters for plotting
+            float(r["median"]), float(r["min"]), float(r["max"])
+        md_txt = (res / "main_table.md").read_text(encoding="utf-8")
+        assert "(budget-limited 1/2)" in md_txt, md_txt
+        (res / "epoch_saturation.csv").unlink()
+
         # axis B: its own table, and it must NOT leak into main_table
         for tag, n in (("eval_b1_road420", 7), ("eval_b2_F1", 3)):
             acc = dict(tp=1, fp=1, fn=1, sp_in_g=1, sp=2, sg_in_p=1, sg=2,
@@ -611,7 +660,8 @@ def selftest():
     print("selftest PASS: pooled=counts-exact (0.7/0.5), delta 0.2, "
           "numeric main_table + tidy long + per-image finalize-exact + "
           "timing + rank-flip + initial-FP + axis_b kept out of "
-          "main_table, missing run -> INCOMPLETE + "
+          "main_table + budget-limited mark (md label, csv column, "
+          "numeric cells intact), missing run -> INCOMPLETE + "
           "strict exit 1")
     return 0
 

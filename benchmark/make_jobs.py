@@ -231,6 +231,16 @@ def main():
         f"--marked-list {args.marked_list} --results {args.results}",
         after=last, optional=True)
 
+    # ---- was the epoch budget enough? ------------------------------------
+    # Reads every run's validation curve against the criterion pre-registered
+    # in epoch_saturation.py's docstring, and must run BEFORE summarize, which
+    # picks up epoch_saturation.csv to mark budget-limited rows in the table
+    # itself (Amendment A1.7).
+    add("epoch_saturation",
+        f"python benchmark/epoch_saturation.py --runs runs "
+        f"--results {args.results} --config-dir {args.config_dir.as_posix()}",
+        after=last, optional=True)
+
     # optional BY DESIGN: --strict exits 1 when a run is missing, which is
     # exactly what happens once any optional leaf was skipped. summarize
     # regenerates bit-identically on the local machine from the eval CSVs
