@@ -55,6 +55,28 @@ TRAIN_ONLY="${TRAIN_ONLY:-RW40,N40,N20B}"
 die() { echo "FATAL: $*" >&2; exit 1; }
 step() { echo -e "\n=== $* ==="; }
 
+# ---- interpreter first (A1.13/A1.15): a fresh vast.ai tmux session does not
+# activate the image venv, so the python3 on PATH may not be the one that has
+# (or will get) torch. Find the torch-bearing python3 BEFORE anything runs,
+# so every later step - and every pip install - hits the same interpreter.
+find_torch_python() {
+  local cand
+  for cand in "$(command -v python3 2>/dev/null)" /venv/*/bin/python3 \
+              /opt/conda/bin/python3 /usr/bin/python3; do
+    [ -x "$cand" ] || continue
+    if "$cand" -c "import torch" >/dev/null 2>&1; then echo "$cand"; return 0; fi
+  done
+  return 1
+}
+TORCH_PY="$(find_torch_python || true)"
+if [ -n "$TORCH_PY" ]; then
+  export PATH="$(dirname "$TORCH_PY"):$PATH"
+  echo "interpreter: $TORCH_PY (torch importable) - prepended to PATH"
+else
+  echo "interpreter: no python3 with torch found yet - setup_v2 will install it"
+  echo "  into: $(command -v python3)"
+fi
+
 step "A. POOL -> folds (runs BEFORE setup_v2 so it finds them and skips gdown)"
 if [ -d "$WORK/folds" ] || ls -d "$WORK"/fold_* >/dev/null 2>&1; then
   echo "folds already present - skipping pool build"
@@ -234,8 +256,9 @@ python3 benchmark/check_images.py --selftest || die "check_images selftest FAILE
 
 echo -e "\nsetup_benchmark complete. Next - INTERIM SCOPE (A6 seed 0 + A5, Amendment A1.8):"
 echo "  1. bash run_benchmark.sh smoke-a6     # ~15 min: pipe + s/step for the hour estimate"
-echo "  2. python3 benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
-echo "  3. tmux new -s bm  then  bash run_benchmark.sh full"
+echo "  2. source /workspace/.bm_env   # PATH + interpreter (needed in any NEW shell/tab)"
+echo "  3. python3 benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
+echo "  4. bash run_benchmark.sh full  # inside tmux; job progress streams to this screen"
 echo ""
 echo "  (the full six-row grid is SHELVED pending the advisor - Q18.4. To run it:"
 echo "   bash run_benchmark.sh smoke, then make_jobs.py with no --rows/--seeds.)"

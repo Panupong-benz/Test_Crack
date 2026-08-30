@@ -6,7 +6,7 @@
 # The full 4a ladder (jobs_template.yaml) stays for the shelved baseline grid.
 jobs:
   - name: smoke_eval_unit
-    cmd: python benchmark/eval_masks.py --selftest
+    cmd: python3 benchmark/eval_masks.py --selftest
   # tiny-fold 1-epoch probe through the SAME config the queue trains with
   # (A1.4 item: FULL_CONFIG == make_jobs --base-config default)
   - name: smoke_sam3

@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -55,23 +56,45 @@ def main():
             state[name] = f"skipped({dep})"
             state_f.write_text(json.dumps(state, indent=2))
             continue
-        print(f"[run ] {name}: {job['cmd']}")
+        # flush=True: the child now writes to our stdout.buffer directly, so an
+        # unflushed parent print would appear AFTER the job output it announces
+        print(f"[run ] {name}: {job['cmd']}", flush=True)
         # breadcrumb for resource_monitor.py: which job the samples belong to.
         # Safe for every other consumer - timing.csv / epoch_saturation read
         # only keys ending in _hours.
         state["_running"] = name
         state_f.write_text(json.dumps(state, indent=2))
         t0 = time.time()
-        # stdout is a FILE, not a tty, so the child block-buffers print()
-        # (8 KB) and tqdm's \r updates carry no newline for a line-buffered
-        # stderr to flush on. The log therefore stayed EMPTY for hours while
-        # training ran fine, leaving no way to tell slow from hung (A1.14).
-        # PYTHONUNBUFFERED makes both appear as they happen; the cost is a
-        # noisier log, which is the right trade for a paid run.
+        # Stream child output to the TERMINAL and the log at once (A1.14/A1.15).
+        # With stdout=log alone the operator watched a silent screen for hours:
+        # the child block-buffered print() at 8 KB and tqdm's \r updates gave
+        # a line-buffered stderr nothing to flush on, so slow and hung looked
+        # identical. PYTHONUNBUFFERED=1 defeats the buffering; the raw-byte
+        # pass-through below lets the terminal render \r as a live progress
+        # bar while the log keeps every byte. Never decode/re-encode here -
+        # tqdm mixes \r and unicode blocks, and line-splitting would hold the
+        # bar back until the epoch ends.
         env = dict(os.environ, PYTHONUNBUFFERED="1")
-        with open(f"runs/{name}.log", "a", encoding="utf-8") as log:
-            r = subprocess.run(job["cmd"], shell=True, env=env,
-                               stdout=log, stderr=subprocess.STDOUT)
+        rc = None
+        with open(f"runs/{name}.log", "ab") as log:
+            proc = subprocess.Popen(job["cmd"], shell=True, env=env,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT)
+            out = getattr(sys.stdout, "buffer", None)
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                log.write(chunk)
+                log.flush()
+                if out is not None:
+                    try:
+                        out.write(chunk)
+                        out.flush()
+                    except OSError:      # terminal gone (detached/ssh drop):
+                        out = None       # keep the job + log alive regardless
+            rc = proc.wait()
+        r = subprocess.CompletedProcess(job["cmd"], rc)
         state[name] = "ok" if r.returncode == 0 else f"exit{r.returncode}"
         state[f"{name}_hours"] = round((time.time() - t0) / 3600, 3)
         state["_running"] = ""
