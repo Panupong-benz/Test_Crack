@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -61,8 +62,15 @@ def main():
         state["_running"] = name
         state_f.write_text(json.dumps(state, indent=2))
         t0 = time.time()
+        # stdout is a FILE, not a tty, so the child block-buffers print()
+        # (8 KB) and tqdm's \r updates carry no newline for a line-buffered
+        # stderr to flush on. The log therefore stayed EMPTY for hours while
+        # training ran fine, leaving no way to tell slow from hung (A1.14).
+        # PYTHONUNBUFFERED makes both appear as they happen; the cost is a
+        # noisier log, which is the right trade for a paid run.
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
         with open(f"runs/{name}.log", "a", encoding="utf-8") as log:
-            r = subprocess.run(job["cmd"], shell=True,
+            r = subprocess.run(job["cmd"], shell=True, env=env,
                                stdout=log, stderr=subprocess.STDOUT)
         state[name] = "ok" if r.returncode == 0 else f"exit{r.returncode}"
         state[f"{name}_hours"] = round((time.time() - t0) / 3600, 3)
