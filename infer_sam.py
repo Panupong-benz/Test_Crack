@@ -44,6 +44,7 @@ from typing import List, Optional, Union
 import torch
 import numpy as np
 from PIL import Image as PILImage
+from PIL import ImageOps as PILImageOps
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import yaml
@@ -83,6 +84,20 @@ from sam3.train.transforms.basic_for_api import (
 
 # LoRA imports
 from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
+
+
+def _open_image_oriented(path):
+    """Open a photo in the SAME frame the annotations live in.
+
+    PIL ignores the EXIF orientation flag; Roboflow and cv2.imread apply it,
+    so a COCO record and every mask for a flagged photo are in the ROTATED
+    frame. 15 of the 381 POOL_BM images carry flag 6/8 (RW20C 12, RW20L 1,
+    N20B 2 - all from the 2026-08 full-res exports): raw PIL hands back a
+    landscape array for a portrait COCO record, so the predicted mask came
+    out on the wrong axis and eval_masks then squashed it to the GT shape.
+    Found 2026-08-30, benchmark_protocol Amendment A1.4.
+    """
+    return PILImageOps.exif_transpose(PILImage.open(path)).convert("RGB")
 
 
 class SAM3LoRAInference:
@@ -391,7 +406,7 @@ class SAM3LoRAInference:
         else:
             if not os.path.exists(image_path):
                 raise FileNotFoundError(f"Image not found: {image_path}")
-            pil_image_raw = PILImage.open(image_path).convert("RGB")
+            pil_image_raw = _open_image_oriented(image_path)
             src_repr = image_path
 
         if verbose:
@@ -588,7 +603,7 @@ class SAM3LoRAInference:
         else:
             if not os.path.exists(image_path):
                 raise FileNotFoundError(f"Image not found: {image_path}")
-            pil_full = PILImage.open(image_path).convert("RGB")
+            pil_full = _open_image_oriented(image_path)
         W, H = pil_full.size
         stride = max(1, int(round(tile_size * (1.0 - overlap))))
 
@@ -795,7 +810,7 @@ class SAM3LoRAInference:
         else:
             if not os.path.exists(image_path):
                 raise FileNotFoundError(f"Image not found: {image_path}")
-            pil_raw = PILImage.open(image_path).convert("RGB")
+            pil_raw = _open_image_oriented(image_path)
             src_repr = image_path
 
         orig_w, orig_h = pil_raw.size

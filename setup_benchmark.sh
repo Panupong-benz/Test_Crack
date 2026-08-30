@@ -76,6 +76,11 @@ else
       --expected "$WORK/pool_extract/folds_summary_expected.json" \
       --got "$WORK/folds/folds_summary.json" \
       || die "fold gate FAILED - the pool did not reproduce the frozen split"
+  # image frame vs COCO record: PIL ignores EXIF orientation while Roboflow
+  # applied it, so a flagged photo would train/predict on the wrong axis
+  # (Amendment A1.4). ~1 s for 381 header reads.
+  python3 "$REPO_DIR/benchmark/check_images.py" --data "$WORK/folds" \
+      || die "image gate FAILED - image frame does not match the COCO record"
 fi
 
 step "B. base bootstrap (setup_v2.sh: GPU gate / deps / HF / dataset verify)"
