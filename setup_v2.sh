@@ -26,6 +26,17 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 step "0. GPU / torch / CUDA gate"
 command -v nvidia-smi >/dev/null || die "no nvidia-smi"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+# The design PROTECTS the image's torch and never reinstalls it - but that
+# assumes a PyTorch cu128 template. A plain CUDA image has no torch at all,
+# and the gate below then died on a bare ModuleNotFoundError traceback, which
+# reads like a broken gate rather than a wrong image (A1.12). Install it only
+# when it is genuinely absent; an existing torch is still never touched.
+if ! python3 -c "import torch" >/dev/null 2>&1; then
+  echo "torch is NOT in this image - installing the cu128 wheel (a few GB)."
+  echo "Next time pick a PyTorch template with CUDA 12.8 (runbook SS2)."
+  pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
+    || die "torch cu128 install failed - rent a PyTorch cu128 image instead"
+fi
 python3 - <<'PY' || exit 1
 import sys
 import torch
