@@ -24,12 +24,29 @@ WORK=/workspace
 # folds_summary - a stronger gate than a zip checksum.
 # md5 recorded in benchmark_protocol.md Amendment A1/A1.3.
 POOL_ZIP="${POOL_ZIP:-$WORK/pool_BM.zip}"
-# Google Drive file id of pool_BM.zip. Upload the zip to Drive ONCE; every
-# re-rented instance then pulls it in ~1 min instead of re-uploading 1 GB.
-# Baked in 2026-08-30 (Amendment A1.6); override with the env var if the
-# file is re-uploaded. The share must be "anyone with the link" or gdown
-# saves an HTML permission page - the size gate below catches that.
-POOL_GDRIVE_ID="${POOL_GDRIVE_ID:-1iQz5PEGIYBm7y50V3N3oqUmKgGyKU_s3}"
+# ============ PASTE YOUR GOOGLE DRIVE LINK HERE ============
+#
+#   The file to upload is       03_annotation\_upload\pool_BM.zip
+#                               (1,063,568,047 bytes, md5 d364d0e4...)
+#   NOT                         03_annotation\_pool\POOL_BM.zip
+#
+# Those two names are one character apart and the wrong one was uploaded once
+# already (Amendment A1.10): it is a hand-zipped copy of the pool FOLDER, so
+# it has no pool/ + tools/ layout and cannot be used even if the md5 gate is
+# bypassed. Check the size before uploading.
+#
+# Any of these forms works - the script tells them apart:
+#   https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
+#   https://drive.google.com/drive/folders/<FOLDER_ID>
+#   <FILE_ID>            (bare id, as before)
+# Sharing must be "Anyone with the link", otherwise gdown saves an HTML
+# permission page instead of the zip (the size gate below catches that).
+# Leave empty to upload by hand instead: scp / vastai copy to $WORK.
+#
+POOL_GDRIVE="${POOL_GDRIVE:-}"
+# ===========================================================
+# backward-compatible alias: older notes/commands export POOL_GDRIVE_ID
+POOL_GDRIVE="${POOL_GDRIVE:-${POOL_GDRIVE_ID:-}}"
 POOLBM_MD5="${POOLBM_MD5:-d364d0e4f01406b7aadaed385e767663}"   # frozen A1.3
 TEST_WALLS="${TEST_WALLS:-RW20,RW20C,RW20L,RW20T}"
 TRAIN_ONLY="${TRAIN_ONLY:-RW40,N40,N20B}"
@@ -43,22 +60,50 @@ if [ -d "$WORK/folds" ] || ls -d "$WORK"/fold_* >/dev/null 2>&1; then
   echo "folds already present - skipping pool build"
 else
   # fetch the pool if it is not already on disk
-  if [ ! -f "$POOL_ZIP" ] && [ -n "$POOL_GDRIVE_ID" ]; then
-    echo "downloading pool from Google Drive id $POOL_GDRIVE_ID"
+  if [ ! -f "$POOL_ZIP" ] && [ -n "$POOL_GDRIVE" ]; then
     pip install -q -U gdown
-    # NOT `gdown --id`: that flag was REMOVED in gdown 5.x and the pip
-    # line above always installs the newest one. uc?id= works on every
-    # version; --fuzzy on the share URL is the fallback.
-    gdown "https://drive.google.com/uc?id=$POOL_GDRIVE_ID" -O "$POOL_ZIP" || \
-      gdown --fuzzy "https://drive.google.com/file/d/$POOL_GDRIVE_ID/view" -O "$POOL_ZIP" || \
-      die "gdown failed - upload $POOL_ZIP to $WORK via Jupyter/scp and re-run"
+    # A pasted link can be a FILE link, a FOLDER link, or a bare id. Tell
+    # them apart instead of demanding one shape - pasting the folder link is
+    # the natural thing to do and it used to fail silently (A1.10).
+    src_kind="file"; src_id="$POOL_GDRIVE"
+    case "$POOL_GDRIVE" in
+      *"/folders/"*)
+        src_kind="folder"
+        src_id="${POOL_GDRIVE##*/folders/}"; src_id="${src_id%%[/?]*}" ;;
+      *"/file/d/"*)
+        src_id="${POOL_GDRIVE##*/file/d/}"; src_id="${src_id%%[/?]*}" ;;
+      *"uc?id="*)
+        src_id="${POOL_GDRIVE##*uc?id=}"; src_id="${src_id%%[&]*}" ;;
+    esac
+    echo "pool source: $src_kind  id=$src_id"
+    if [ "$src_kind" = "folder" ]; then
+      rm -rf "$WORK/_pooldl"
+      gdown --folder "https://drive.google.com/drive/folders/$src_id" \
+            -O "$WORK/_pooldl" || die "gdown --folder failed (is the folder
+  shared as 'Anyone with the link'?)"
+      found=$(find "$WORK/_pooldl" -name "pool_BM.zip" | head -1)
+      if [ -z "$found" ]; then
+        n=$(find "$WORK/_pooldl" -name "*.zip" | wc -l)
+        [ "$n" = "1" ] || { ls -lR "$WORK/_pooldl"; die "expected pool_BM.zip
+  in that folder; found $n zip(s). Upload 03_annotation/_upload/pool_BM.zip."; }
+        found=$(find "$WORK/_pooldl" -name "*.zip" | head -1)
+      fi
+      mv "$found" "$POOL_ZIP" || die "could not move $found -> $POOL_ZIP"
+    else
+      # NOT `gdown --id`: that flag was REMOVED in gdown 5.x and the pip
+      # line above always installs the newest one. uc?id= works on every
+      # version; --fuzzy on the share URL is the fallback.
+      gdown "https://drive.google.com/uc?id=$src_id" -O "$POOL_ZIP" || \
+        gdown --fuzzy "https://drive.google.com/file/d/$src_id/view" -O "$POOL_ZIP" || \
+        die "gdown failed - upload $POOL_ZIP to $WORK via Jupyter/scp and re-run"
+    fi
   fi
   # HARD STOP: without the pool this used to fall through to setup_v2's gdown
   # of an OLD folds.zip, and check_folds never ran - the whole 181-job queue
   # would train on the wrong dataset in silence. Never again.
-  [ -f "$POOL_ZIP" ] || die "no $POOL_ZIP and no POOL_GDRIVE_ID set.
+  [ -f "$POOL_ZIP" ] || die "no $POOL_ZIP and no POOL_GDRIVE set.
   Upload pool_BM.zip to $WORK (scp/vastai copy/Jupyter) or export
-  POOL_GDRIVE_ID=<drive file id>. Refusing to continue: the legacy folds
+  POOL_GDRIVE='<drive link>'. Refusing to continue: the legacy folds
   fallback would silently train on the wrong dataset."
 
   # A 1 GB file goes through Drive's virus-scan interstitial. If sharing
@@ -74,7 +119,13 @@ else
   got=$(md5sum "$POOL_ZIP" | cut -d' ' -f1)
   echo "$(basename "$POOL_ZIP") md5 = $got   (expected: $POOLBM_MD5)"
   if [ "$POOLBM_MD5" != "TBD-at-freeze" ] && [ "$got" != "$POOLBM_MD5" ]; then
-    die "md5 mismatch - wrong pool archive (Amendment A1 records the frozen one)"
+    if [ "$got" = "00a444f459ff36001cd46dc4daf12aef" ]; then
+      die "md5 mismatch: this is _pool/POOL_BM.zip (the hand-zipped pool
+  FOLDER), not the packed artifact. Upload 03_annotation/_upload/pool_BM.zip
+  instead - 1,063,568,047 bytes, md5 $POOLBM_MD5 (Amendment A1.10)."
+    fi
+    die "md5 mismatch - wrong pool archive (Amendment A1 records the frozen
+  one: 03_annotation/_upload/pool_BM.zip, 1,063,568,047 bytes)"
   fi
   [ "$POOLBM_MD5" = "TBD-at-freeze" ] && \
     echo "WARN: POOLBM_MD5 not set - running unfrozen data (smoke only!)"
