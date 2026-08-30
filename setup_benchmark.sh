@@ -140,16 +140,34 @@ else
       --meta "$META" --out "$WORK/folds" \
       --test-walls "$TEST_WALLS" --train-only "$TRAIN_ONLY" \
       --img-mode symlink || die "lowo_split failed"
+fi
+
+# ---- data gates: OUTSIDE the build branch, so a re-run still gates ----
+# The first real rental died at the image gate AFTER folds were written, so
+# a re-run took the "folds already present" path and would have skipped both
+# gates entirely - the failure would have vanished instead of being fixed
+# (A1.11). ~2 s. The fold gate needs the frozen expectation from the pool
+# archive; the image gate needs only the folds.
+if [ -f "$WORK/pool_extract/folds_summary_expected.json" ]; then
   python3 "$REPO_DIR/benchmark/check_folds.py" \
       --expected "$WORK/pool_extract/folds_summary_expected.json" \
       --got "$WORK/folds/folds_summary.json" \
       || die "fold gate FAILED - the pool did not reproduce the frozen split"
-  # image frame vs COCO record: PIL ignores EXIF orientation while Roboflow
-  # applied it, so a flagged photo would train/predict on the wrong axis
-  # (Amendment A1.4). ~1 s for 381 header reads.
-  python3 "$REPO_DIR/benchmark/check_images.py" --data "$WORK/folds" \
-      || die "image gate FAILED - image frame does not match the COCO record"
+else
+  echo "fold gate: SKIPPED - folds already on disk; re-extract the pool to gate them"
 fi
+# image frame vs COCO record: PIL ignores EXIF orientation while Roboflow
+# applied it, so a flagged photo would train/predict on the wrong axis
+# (Amendment A1.4). ~1 s for 381 header reads.
+# Pillow is the gate's ONLY third-party import and deps do not install
+# until steps B/C, so a fresh instance reached this line with no PIL and
+# the gate died on ModuleNotFoundError - reported as "image gate FAILED",
+# i.e. a data verdict for an environment fault (A1.11). Ensure it here;
+# the gate must stay in step A, before the expensive bootstrap.
+python3 -c "import PIL" 2>/dev/null || pip install -q pillow \
+    || die "could not install Pillow for the image gate"
+python3 "$REPO_DIR/benchmark/check_images.py" --data "$WORK/folds" \
+    || die "image gate FAILED - image frame does not match the COCO record"
 
 step "B. base bootstrap (setup_v2.sh: GPU gate / deps / HF / dataset verify)"
 bash "$REPO_DIR/setup_v2.sh" || die "setup_v2.sh failed"
@@ -194,8 +212,16 @@ python3 benchmark/eval_masks.py --selftest || die "eval_masks selftest FAILED"
 # dataset.json or label range would surface after every training hour was
 # already paid for (Amendment A1.5). Two seconds here instead.
 python3 benchmark/to_nnunet.py --selftest || die "to_nnunet selftest FAILED"
+# the image gate above runs on all-clean data, so a broken gate would pass
+# silently. Its selftest plants a genuinely EXIF-flagged image and asserts
+# raw 40x20 FAILS where oriented 20x40 passes - a green line here proves the
+# gate can detect, not merely that it ran (A1.11).
+python3 benchmark/check_images.py --selftest || die "check_images selftest FAILED"
 
-echo -e "\nsetup_benchmark complete. Next (runbook SS4):"
-echo "  1. bash run_benchmark.sh smoke        # Phase 4a (~1 h): env+50-step+batch sweep"
-echo "  2. fill measured batch into: python benchmark/make_jobs.py --batch <B> --out jobs.yaml"
-echo "  3. bash run_benchmark.sh full         # kill-gate first, then the whole grid"
+echo -e "\nsetup_benchmark complete. Next - INTERIM SCOPE (A6 seed 0 + A5, Amendment A1.8):"
+echo "  1. bash run_benchmark.sh smoke-a6     # ~15 min: pipe + s/step for the hour estimate"
+echo "  2. python benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
+echo "  3. tmux new -s bm  then  bash run_benchmark.sh full"
+echo ""
+echo "  (the full six-row grid is SHELVED pending the advisor - Q18.4. To run it:"
+echo "   bash run_benchmark.sh smoke, then make_jobs.py with no --rows/--seeds.)"

@@ -36,8 +36,12 @@ import json
 import sys
 from pathlib import Path
 
-from PIL import Image as PILImage
-from PIL import ImageOps as PILImageOps
+try:
+    from PIL import Image as PILImage
+    from PIL import ImageOps as PILImageOps
+except ImportError:  # A1.11 - an env fault must not read as a data verdict
+    sys.exit("check_images: Pillow is not installed. This is an ENVIRONMENT "
+             "fault, NOT an image/COCO mismatch. Run: pip install pillow")
 
 SPLITS = ("train", "valid", "test")
 EXIF_ORIENTATION = 274
