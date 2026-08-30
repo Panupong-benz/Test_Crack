@@ -199,12 +199,26 @@ export nnUNet_preprocessed="$WORK/nnUNet_preprocessed"
 export nnUNet_results="$WORK/nnUNet_results"
 mkdir -p "$nnUNet_raw" "$nnUNet_preprocessed" "$nnUNet_results"
 # persist for later shells / queue jobs
+# Pin the interpreter that actually has torch. A vast.ai image often keeps
+# torch in a venv (/venv/main) that a FRESH tmux session does not activate,
+# and some images have no `python` alias at all - so a queue launched from
+# a reconnected session ran the SYSTEM python3 and every job died on
+# "No module named 'torch'" while the smoke, run in the original session,
+# had just used 17 GB of VRAM (A1.13). Resolve it once, here, where it is
+# provably right, and let run_benchmark.sh put it on PATH for every job.
+PYBIN="$(python3 -c "import sys, torch; sys.stdout.write(sys.executable)" 2>/dev/null)"
+[ -n "$PYBIN" ] || die "the python3 on PATH cannot import torch - setup should have fixed this"
+PYDIR="$(dirname "$PYBIN")"
 cat > "$WORK/.bm_env" <<ENV
 export nnUNet_raw="$nnUNet_raw"
 export nnUNet_preprocessed="$nnUNet_preprocessed"
 export nnUNet_results="$nnUNet_results"
+# interpreter pinned at setup time (A1.13); PATH first so both `python3`
+# and any `python` shim in the same dir resolve to the torch-bearing one
+export BM_PYBIN="$PYBIN"
+export PATH="$PYDIR:$PATH"
 ENV
-echo "nnU-Net dirs exported + saved to $WORK/.bm_env"
+echo "nnU-Net dirs + interpreter ($PYBIN) saved to $WORK/.bm_env"
 
 step "F. selftests (final gate)"
 python3 benchmark/eval_masks.py --selftest || die "eval_masks selftest FAILED"
@@ -220,7 +234,7 @@ python3 benchmark/check_images.py --selftest || die "check_images selftest FAILE
 
 echo -e "\nsetup_benchmark complete. Next - INTERIM SCOPE (A6 seed 0 + A5, Amendment A1.8):"
 echo "  1. bash run_benchmark.sh smoke-a6     # ~15 min: pipe + s/step for the hour estimate"
-echo "  2. python benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
+echo "  2. python3 benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
 echo "  3. tmux new -s bm  then  bash run_benchmark.sh full"
 echo ""
 echo "  (the full six-row grid is SHELVED pending the advisor - Q18.4. To run it:"

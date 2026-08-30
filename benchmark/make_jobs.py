@@ -13,10 +13,10 @@ output_dir live in the YAML. This script clones the base config per
 (fold, seed) with those three keys overridden — nothing else is touched.
 
 Run on the instance AFTER the smoke hour (batch sizes measured there):
-  python benchmark/make_jobs.py --data-root data --out jobs.yaml \
+  python3 benchmark/make_jobs.py --data-root data --out jobs.yaml \
       --base-config configs/full_lora_config.yaml \
       --batch 8 --gate-eval-first
-Then:  python benchmark/queue_runner.py --jobs jobs.yaml --poweroff
+Then:  python3 benchmark/queue_runner.py --jobs jobs.yaml --poweroff
 
 nnU-Net seed note: nnUNetv2_train exposes no seed flag; the 3-seed policy for
 row A1 is decided at smoke hour (trainer subclass or a declared 1-seed row in
@@ -107,17 +107,17 @@ def main():
         # globs eval_*.summary.json, so the SMOKE eval must not use it or every
         # real run would carry a "WARN: unrecognized tag eval_smoke" line.
         out = out_name or f"eval_{tag}.csv"
-        return (f"python benchmark/eval_masks.py "
+        return (f"python3 benchmark/eval_masks.py "
                 f"--gt {args.data_root}/fold_{fold}/test "
                 f"--pred {pred_dir} "
                 f"--out {args.results}/{out} "
                 f"--marked-list {args.marked_list}")
 
     # ---- Phase 4a: smoke (eval unit test + 50-step per SELECTED arch) ----
-    prev = add("smoke_eval_unit", "python benchmark/eval_masks.py --selftest")
+    prev = add("smoke_eval_unit", "python3 benchmark/eval_masks.py --selftest")
     for arch in seg_rows:
         prev = add(f"smoke_{arch}",
-                   f"python benchmark/train_seg.py --arch {arch} "
+                   f"python3 benchmark/train_seg.py --arch {arch} "
                    f"--data {args.data_root}/fold_{args.folds[0]} "
                    f"--out runs/smoke_{arch} --seed 0 --batch {args.batch} "
                    f"--smoke 50", after=prev)
@@ -130,7 +130,7 @@ def main():
     # predict_seg jobs to protect.)
     if seg_rows:
         prev = add("smoke_predict",
-                   f"python benchmark/predict_seg.py "
+                   f"python3 benchmark/predict_seg.py "
                    f"--run runs/smoke_{seg_rows[0]} "
                    f"--fold {args.data_root}/fold_{args.folds[0]} "
                    f"--out runs/smoke_{seg_rows[0]}/masks --limit 3",
@@ -151,11 +151,11 @@ def main():
         cfg_path = args.config_dir / f"{tag}.yaml"
         cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False),
                             encoding="utf-8")
-        t = add(tag, f"python train_sam3_lora_native_claude.py "
+        t = add(tag, f"python3 train_sam3_lora_native_claude.py "
                      f"--config {cfg_path.as_posix()}", after=after)
         # weight filename confirmed at smoke hour; find keeps it layout-proof
         i = add(f"infer_{tag}",
-                f"python benchmark/run_a5_zeroshot.py "
+                f"python3 benchmark/run_a5_zeroshot.py "
                 f"--fold {args.data_root}/fold_{fold} --out runs/{tag}/masks "
                 f"--weights \"$(find runs/{tag} -name best_lora_weights.pt "
                 f"| head -1)\"", after=t, optional=not gate)
@@ -183,7 +183,7 @@ def main():
     if "a5" in rows:
         for fold in args.folds:
             tag = f"a5_{fold}"
-            i = add(tag, f"python benchmark/run_a5_zeroshot.py "
+            i = add(tag, f"python3 benchmark/run_a5_zeroshot.py "
                          f"--fold {args.data_root}/fold_{fold} "
                          f"--out runs/{tag}/masks", after=last, optional=True)
             add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
@@ -195,7 +195,7 @@ def main():
             for seed in args.seeds:
                 tag = f"{arch}_{fold}_s{seed}"
                 t = add(tag,
-                        f"python benchmark/train_seg.py --arch {arch} "
+                        f"python3 benchmark/train_seg.py --arch {arch} "
                         f"--data {args.data_root}/fold_{fold} "
                         f"--out runs/{tag} --seed {seed} "
                         f"--batch {args.batch} --epochs {args.epochs} "
@@ -206,7 +206,7 @@ def main():
                 # regenerated. Before A1.5 a broken eval took the remaining 35
                 # runs plus all of A1 down with it.
                 p = add(f"pred_{tag}",
-                        f"python benchmark/predict_seg.py --run runs/{tag} "
+                        f"python3 benchmark/predict_seg.py --run runs/{tag} "
                         f"--fold {args.data_root}/fold_{fold} "
                         f"--out runs/{tag}/masks", after=t, optional=True)
                 add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
@@ -219,7 +219,7 @@ def main():
         name = f"BM_{fold}"
         tag = f"a1_{fold}"
         c = add(f"nnraw_{tag}",
-                f"python benchmark/to_nnunet.py "
+                f"python3 benchmark/to_nnunet.py "
                 f"--fold {args.data_root}/fold_{fold} --dataset-id {did} "
                 f"--name {name} --raw \"$nnUNet_raw\"", after=last)
         p1 = add(f"nnplan_{tag}",
@@ -244,7 +244,7 @@ def main():
     # commands by hand; now downloading the data is enough, and not
     # downloading it costs nothing but a recorded skip in axis_b_auto.json.
     add("axis_b",
-        f"python benchmark/axis_b.py auto --data-root {args.data_root} "
+        f"python3 benchmark/axis_b.py auto --data-root {args.data_root} "
         f"--folds {' '.join(args.folds)} "
         f"--marked-list {args.marked_list} --results {args.results}",
         after=last, optional=True)
@@ -255,7 +255,7 @@ def main():
     # picks up epoch_saturation.csv to mark budget-limited rows in the table
     # itself (Amendment A1.7).
     add("epoch_saturation",
-        f"python benchmark/epoch_saturation.py --runs runs "
+        f"python3 benchmark/epoch_saturation.py --runs runs "
         f"--results {args.results} --config-dir {args.config_dir.as_posix()}",
         after=last, optional=True)
 
@@ -265,7 +265,7 @@ def main():
     # (runbook SS5 item 4), so it must never be the thing that blocks the
     # archive - the exit code still lands in queue_state.json to be read.
     add("summarize",
-        f"python benchmark/summarize_benchmark.py --results {args.results} "
+        f"python3 benchmark/summarize_benchmark.py --results {args.results} "
         f"--folds {' '.join(args.folds)} "
         f"--seeds {' '.join(map(str, args.seeds))} "
         f"--models {' '.join(r for r in ALL_ROWS if r in rows)} "
@@ -276,7 +276,7 @@ def main():
     # (poweroff fires before control returns to bash) and must precede collect
     # so the summary lands inside the tar.
     add("resource_report",
-        "python benchmark/resource_monitor.py --report", optional=True)
+        "python3 benchmark/resource_monitor.py --report", optional=True)
 
     # queue_runner --poweroff destroys the box right after the last job, so
     # the tarball MUST be the last job (Amendment A1.4) and it carries NO
@@ -284,7 +284,7 @@ def main():
     # and poweroff then destroyed the night's results (Amendment A1.5).
     # optional as well: a failed archive must not stop the poweroff, and the
     # runbook tells you to run it by hand if the queue died earlier.
-    add("collect", "python benchmark/collect_results.py", optional=True)
+    add("collect", "python3 benchmark/collect_results.py", optional=True)
 
     args.out.write_text(yaml.safe_dump({"jobs": jobs}, sort_keys=False,
                                        width=1000), encoding="utf-8")
