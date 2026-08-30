@@ -120,8 +120,12 @@ export nnUNet_results="$nnUNet_results"
 ENV
 echo "nnU-Net dirs exported + saved to $WORK/.bm_env"
 
-step "F. evaluator selftest (final gate)"
+step "F. selftests (final gate)"
 python3 benchmark/eval_masks.py --selftest || die "eval_masks selftest FAILED"
+# to_nnunet runs only in the LAST block of the queue (row A1), so a bad
+# dataset.json or label range would surface after every training hour was
+# already paid for (Amendment A1.5). Two seconds here instead.
+python3 benchmark/to_nnunet.py --selftest || die "to_nnunet selftest FAILED"
 
 echo -e "\nsetup_benchmark complete. Next (runbook SS4):"
 echo "  1. bash run_benchmark.sh smoke        # Phase 4a (~1 h): env+50-step+batch sweep"

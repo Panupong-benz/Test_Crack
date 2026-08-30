@@ -9,9 +9,14 @@ completion touches QUEUE_DONE and optionally powers the instance off.
   python queue_runner.py --jobs jobs.yaml [--poweroff]
 
 Rules:
-- a job with "after": <name> is skipped until that job succeeded (kill-gate:
-  put the gate job first, everything else 'after' it)
-- a failed job stops the queue (money-safe default) unless "optional": true
+- a job with "after": <name> is SKIPPED (and the queue carries on) when that
+  job did not succeed. It used to `break` the whole loop, which meant one
+  skipped leaf ended the run - see Amendment A1.5.
+- a failed job stops the queue (money-safe default) unless "optional": true.
+  This is what still enforces the kill-gate: the gate chain is not optional,
+  so a bad gate returns 1 here before anything expensive follows.
+- so the two flags say different things: "optional" = this failing must not
+  stop the queue; "after" = do not bother running me if my input is missing.
 """
 from __future__ import annotations
 
@@ -42,8 +47,13 @@ def main():
             continue
         dep = job.get("after")
         if dep and state.get(dep) != "ok":
-            print(f"[stop] {name} needs {dep} which is not ok")
-            break
+            # continue, NOT break: an optional pred/eval that failed must cost
+            # us only its own dependents, never the trainings and the archive
+            # that follow it in the queue (Amendment A1.5).
+            print(f"[skip] {name} needs {dep} which is not ok")
+            state[name] = f"skipped({dep})"
+            state_f.write_text(json.dumps(state, indent=2))
+            continue
         print(f"[run ] {name}: {job['cmd']}")
         t0 = time.time()
         with open(f"runs/{name}.log", "a", encoding="utf-8") as log:

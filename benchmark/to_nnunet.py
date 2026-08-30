@@ -16,6 +16,7 @@ declared in benchmark_protocol Amendment A1 before any run.
 Usage:
   python to_nnunet.py --fold <fold_dir> --dataset-id 501 \
       --name BMfoldRW20 --raw <nnUNet_raw_dir>
+  python to_nnunet.py --selftest
 """
 from __future__ import annotations
 
@@ -53,41 +54,36 @@ def crop_pad(arr, x0, y0, fill=0):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fold", type=Path, required=True)
-    ap.add_argument("--dataset-id", type=int, required=True)
-    ap.add_argument("--name", required=True)
-    ap.add_argument("--raw", type=Path, required=True,
-                    help="nnUNet_raw root")
-    args = ap.parse_args()
-
-    ds = args.raw / f"Dataset{args.dataset_id:03d}_{args.name}"
+def convert(fold: Path, dataset_id: int, name: str, raw: Path) -> Path:
+    ds = raw / f"Dataset{dataset_id:03d}_{name}"
     (ds / "imagesTr").mkdir(parents=True, exist_ok=True)
     (ds / "labelsTr").mkdir(exist_ok=True)
     (ds / "imagesTs").mkdir(exist_ok=True)
 
     n_tr = 0
     for split in ("train", "valid"):
-        gts = load_gt_masks(args.fold / split)
-        for name, gt in sorted(gts.items()):
-            img = cv2.imread(str(args.fold / split / name))
+        gts = load_gt_masks(fold / split)
+        for nm, gt in sorted(gts.items()):
+            img = cv2.imread(str(fold / split / nm))
             if img is None:
-                print(f"WARNING missing image {split}/{name}")
+                print(f"WARNING missing image {split}/{nm}")
                 continue
             fill = int(img.mean())
             for i, (x0, y0) in enumerate(tile_origins(*img.shape[1::-1])):
-                stem = f"{Path(name).stem}_t{i:02d}"
+                stem = f"{Path(nm).stem}_t{i:02d}"
                 cv2.imwrite(str(ds / "imagesTr" / f"{stem}_0000.png"),
                             crop_pad(img, x0, y0, fill))
+                # load_gt_masks returns 0/1, which is what "labels" below
+                # declares; writing 0/255 here would fail nnU-Net's
+                # --verify_dataset_integrity. Pinned by selftest().
                 cv2.imwrite(str(ds / "labelsTr" / f"{stem}.png"),
                             crop_pad(gt, x0, y0, 0))
                 n_tr += 1
 
-    gts_ts = load_gt_masks(args.fold / "test")
-    for name in sorted(gts_ts):
-        img = cv2.imread(str(args.fold / "test" / name))
-        cv2.imwrite(str(ds / "imagesTs" / f"{Path(name).stem}_0000.png"), img)
+    gts_ts = load_gt_masks(fold / "test")
+    for nm in sorted(gts_ts):
+        img = cv2.imread(str(fold / "test" / nm))
+        cv2.imwrite(str(ds / "imagesTs" / f"{Path(nm).stem}_0000.png"), img)
 
     (ds / "dataset.json").write_text(json.dumps({
         # 3 entries, not 1: cv2 writes a 3-channel PNG and nnU-Net's
@@ -99,7 +95,88 @@ def main():
         "file_ending": ".png",
     }, indent=2))
     print(f"{ds}: {n_tr} training tiles, {len(gts_ts)} test frames")
+    return ds
+
+
+def _fake_split(d: Path, names, with_poly=True):
+    d.mkdir(parents=True, exist_ok=True)
+    images, anns = [], []
+    for i, nm in enumerate(names):
+        cv2.imwrite(str(d / nm), np.full((150, 200, 3), 90, np.uint8))
+        images.append({"id": i, "file_name": nm, "width": 200, "height": 150})
+        if with_poly:
+            anns.append({"id": i, "image_id": i, "category_id": 1,
+                         "segmentation": [[10, 10, 60, 10, 60, 20, 10, 20]],
+                         "bbox": [10, 10, 50, 10], "area": 500,
+                         "iscrowd": 0})
+    (d / "_annotations.coco.json").write_text(json.dumps(
+        {"images": images, "annotations": anns,
+         "categories": [{"id": 1, "name": "crack"}]}), encoding="utf-8")
+
+
+def selftest():
+    """to_nnunet's only other execution is the LAST block of the paid queue,
+    so a bad dataset.json or label range would surface after every training
+    hour was already spent (Amendment A1.5). This builds a two-image fold,
+    converts it, and pins what nnU-Net actually validates."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        fold = root / "fold_X"
+        _fake_split(fold / "train", ["a.png", "b.png"])
+        _fake_split(fold / "valid", ["c.png"])
+        _fake_split(fold / "test", ["d.png"])
+        ds = convert(fold, 599, "SELFTEST", root / "raw")
+
+        imgs = sorted((ds / "imagesTr").glob("*.png"))
+        labs = sorted((ds / "labelsTr").glob("*.png"))
+        ts = sorted((ds / "imagesTs").glob("*.png"))
+        meta = json.loads((ds / "dataset.json").read_text())
+
+        assert len(imgs) == len(labs) == 3, (len(imgs), len(labs))
+        assert len(ts) == 1, len(ts)
+        assert all(f.name.endswith("_0000.png") for f in imgs), (
+            "nnU-Net requires the _0000 channel suffix on imagesTr")
+        assert all(not f.name.endswith("_0000.png") for f in labs), (
+            "labelsTr must NOT carry the channel suffix")
+        assert ts[0].name.endswith("_0000.png"), ts[0].name
+
+        im = cv2.imread(str(imgs[0]))
+        assert im.shape == (TILE, TILE, 3), im.shape
+        assert len(meta["channel_names"]) == im.shape[2] == 3, meta
+        assert meta["numTraining"] == len(imgs), meta
+        assert meta["file_ending"] == ".png"
+
+        lab = cv2.imread(str(labs[0]), cv2.IMREAD_UNCHANGED)
+        assert lab.shape == (TILE, TILE), lab.shape
+        vals = set(np.unique(lab).tolist())
+        assert vals <= set(meta["labels"].values()), (
+            f"label values {sorted(vals)} are outside the declared "
+            f"{meta['labels']} - nnU-Net --verify_dataset_integrity "
+            f"would reject this dataset")
+        assert 1 in vals, "the planted polygon produced no foreground"
+    print("selftest PASS: 3 tiles + 1 test frame, _0000 suffix on images "
+          "only, labels are 0/1 as dataset.json declares, 3 channel_names")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fold", type=Path)
+    ap.add_argument("--dataset-id", type=int)
+    ap.add_argument("--name")
+    ap.add_argument("--raw", type=Path, help="nnUNet_raw root")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+    if args.selftest:
+        selftest()
+        return 0
+    missing = [k for k in ("fold", "dataset_id", "name", "raw")
+               if getattr(args, k) is None]
+    if missing:
+        ap.error("required unless --selftest: " + ", ".join(missing))
+    convert(args.fold, args.dataset_id, args.name, args.raw)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

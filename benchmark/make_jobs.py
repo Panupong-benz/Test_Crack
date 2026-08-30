@@ -107,9 +107,25 @@ def main():
                    f"--data {args.data_root}/fold_{args.folds[0]} "
                    f"--out runs/smoke_{arch} --seed 0 --batch {args.batch} "
                    f"--smoke 50", after=prev)
+    # predict_seg is the ONLY script whose first execution would otherwise be
+    # hours into the paid queue (A2-A4 inference; A1.5). Exercise the whole
+    # tail here on 3 images off the 50-step probe checkpoint - the numbers are
+    # meaningless, the pipe is what is under test. Spelled exactly like the
+    # real jobs below so the smoke tests the same command, not a similar one.
+    prev = add("smoke_predict",
+               f"python benchmark/predict_seg.py --run runs/smoke_{SEG_ARCHS[0]} "
+               f"--fold {args.data_root}/fold_{args.folds[0]} "
+               f"--out runs/smoke_{SEG_ARCHS[0]}/masks --limit 3", after=prev)
+    prev = add("smoke_eval_real",
+               eval_cmd(args.folds[0], f"runs/smoke_{SEG_ARCHS[0]}/masks",
+                        "smoke"), after=prev)
 
     # ---- A6 SAM3-LoRA: kill-gate run first, then the rest ----------------
-    def a6_jobs(fold, seed, after):
+    def a6_jobs(fold, seed, after, gate=False):
+        """gate=True keeps the whole chain non-optional and returns the EVAL
+        (the kill-gate: a bad gate must stop the queue before the expensive
+        rest). Otherwise infer/eval are optional leaves and the TRAIN is
+        returned, so the chain advances through trainings only (A1.5)."""
         tag = f"a6_{fold}_s{seed}"
         cfg = override_keys(base_cfg, f"{args.data_root}/fold_{fold}",
                             seed, f"runs/{tag}")
@@ -123,11 +139,12 @@ def main():
                 f"python benchmark/run_a5_zeroshot.py "
                 f"--fold {args.data_root}/fold_{fold} --out runs/{tag}/masks "
                 f"--weights \"$(find runs/{tag} -name best_lora_weights.pt "
-                f"| head -1)\"", after=t)
-        return add(f"eval_{tag}",
-                   eval_cmd(fold, f"runs/{tag}/masks", tag), after=i)
+                f"| head -1)\"", after=t, optional=not gate)
+        e = add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
+                after=i, optional=not gate)
+        return e if gate else t
 
-    gate = a6_jobs(args.folds[0], args.seeds[0], prev)
+    gate = a6_jobs(args.folds[0], args.seeds[0], prev, gate=True)
     # GATE: queue_runner stops here automatically if the gate run fails;
     # the clDice-vs-old-checkpoint judgement (runbook 4b) is a manual read
     # of eval_a6_<fold0>_s0 before letting the queue continue overnight.
@@ -139,13 +156,16 @@ def main():
             last = a6_jobs(fold, seed, last)
 
     # ---- A5 zero-shot (no training; cheap, right after the gate) ---------
+    # no training here, so these are leaves off the last A6 train: one failed
+    # zero-shot fold costs its own row and nothing else. `last` is deliberately
+    # NOT advanced, so the A2-A4 block still chains to a training job.
     for fold in args.folds:
         tag = f"a5_{fold}"
         i = add(tag, f"python benchmark/run_a5_zeroshot.py "
                      f"--fold {args.data_root}/fold_{fold} "
-                     f"--out runs/{tag}/masks", after=last)
-        last = add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
-                   after=i)
+                     f"--out runs/{tag}/masks", after=last, optional=True)
+        add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
+            after=i, optional=True)
 
     # ---- A2/A3/A4 --------------------------------------------------------
     for arch in SEG_ARCHS:
@@ -158,12 +178,18 @@ def main():
                         f"--out runs/{tag} --seed {seed} "
                         f"--batch {args.batch} --epochs {args.epochs} "
                         f"--resume", after=last)
+                # pred/eval hang off their OWN train as optional leaves, and
+                # `last` advances through the TRAIN. Training is the expensive
+                # irreplaceable half; masks and scores are cheap and can be
+                # regenerated. Before A1.5 a broken eval took the remaining 35
+                # runs plus all of A1 down with it.
                 p = add(f"pred_{tag}",
                         f"python benchmark/predict_seg.py --run runs/{tag} "
                         f"--fold {args.data_root}/fold_{fold} "
-                        f"--out runs/{tag}/masks", after=t)
-                last = add(f"eval_{tag}",
-                           eval_cmd(fold, f"runs/{tag}/masks", tag), after=p)
+                        f"--out runs/{tag}/masks", after=t, optional=True)
+                add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
+                    after=p, optional=True)
+                last = t
 
     # ---- A1 nnU-Net (per fold; seed policy decided at smoke hour) --------
     for k, fold in enumerate(args.folds):
@@ -183,21 +209,29 @@ def main():
                  f"nnUNetv2_predict "
                  f"-i \"$nnUNet_raw\"/Dataset{did}_{name}/imagesTs "
                  f"-o runs/{tag}/masks -d {did} -c 2d -f all "
-                 f"-tr nnUNetTrainer_250epochs", after=t)
-        last = add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
-                   after=p2)
+                 f"-tr nnUNetTrainer_250epochs", after=t, optional=True)
+        add(f"eval_{tag}", eval_cmd(fold, f"runs/{tag}/masks", tag),
+            after=p2, optional=True)
+        last = t
 
     # ---- final jobs: summary tables, then ARCHIVE -----------------------
+    # optional BY DESIGN: --strict exits 1 when a run is missing, which is
+    # exactly what happens once any optional leaf was skipped. summarize
+    # regenerates bit-identically on the local machine from the eval CSVs
+    # (runbook SS5 item 4), so it must never be the thing that blocks the
+    # archive - the exit code still lands in queue_state.json to be read.
     add("summarize",
         f"python benchmark/summarize_benchmark.py --results {args.results} "
         f"--folds {' '.join(args.folds)} "
-        f"--seeds {' '.join(map(str, args.seeds))} --strict", after=last)
+        f"--seeds {' '.join(map(str, args.seeds))} --strict", after=last,
+        optional=True)
     # queue_runner --poweroff destroys the box right after the last job, so
-    # the tarball MUST be the last job (Amendment A1.4). optional: a failed
-    # archive must not be the thing that stops us from powering off, and the
-    # runbook tells you to run it by hand if the queue dies earlier.
-    add("collect", "python benchmark/collect_results.py",
-        after="summarize", optional=True)
+    # the tarball MUST be the last job (Amendment A1.4) and it carries NO
+    # "after": with `after: summarize` a failing summarize skipped the collect
+    # and poweroff then destroyed the night's results (Amendment A1.5).
+    # optional as well: a failed archive must not stop the poweroff, and the
+    # runbook tells you to run it by hand if the queue died earlier.
+    add("collect", "python benchmark/collect_results.py", optional=True)
 
     args.out.write_text(yaml.safe_dump({"jobs": jobs}, sort_keys=False,
                                        width=1000), encoding="utf-8")

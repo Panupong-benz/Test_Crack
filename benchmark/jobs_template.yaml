@@ -21,10 +21,25 @@ jobs:
     after: smoke_segformer
     cmd: python benchmark/train_seg.py --arch deeplabv3p --data data/fold_RW20
          --out runs/smoke_deeplab --seed 0 --batch 8 --smoke 50
+  # A2-A4 inference tail: predict_seg's only other execution is hours into
+  # the paid queue, so prove the pipe here on 3 images off the 50-step probe
+  # checkpoint (Amendment A1.5). The scores are meaningless by construction;
+  # missing predictions are scored as empty with a WARNING, which is expected.
+  - name: smoke_predict
+    after: smoke_deeplab
+    cmd: python benchmark/predict_seg.py --run runs/smoke_unet
+         --fold data/fold_RW20 --out runs/smoke_unet/masks --limit 3
+  - name: smoke_eval_real
+    after: smoke_predict
+    cmd: python benchmark/eval_masks.py --gt data/fold_RW20/test
+         --pred runs/smoke_unet/masks
+         --out results/benchmark/eval_smoke.csv
+         --marked-list marked_line_images.txt
+
   # SAM3-LoRA smoke: tiny-fold 1-epoch probe via the existing script
   # (REPO_DIR/SRC_FOLD configurable at the top of smoke_test.sh)
   - name: smoke_sam3
-    after: smoke_deeplab
+    after: smoke_eval_real
     cmd: bash smoke_test.sh
 
   # ---- Phases 4b-4e live in the GENERATED jobs.yaml (make_jobs.py):

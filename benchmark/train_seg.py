@@ -191,6 +191,20 @@ def main():
                 print(f"[smoke] {args.smoke} steps in {time.time()-t0:.1f}s "
                       f"({(time.time()-t0)/args.smoke:.2f} s/step), "
                       f"peak VRAM {vram:.2f} GB at batch {args.batch}")
+                # smoke returns BEFORE validate(), so the normal best.pt below
+                # is never written - yet predict_seg.py reads ck["arch"], and
+                # last.pt carries no arch/seed. Without this the smoke hour
+                # cannot exercise the A2-A4 inference path at all, and
+                # predict_seg's first execution would be hours deep in the
+                # paid queue (Amendment A1.5). NOT a trained model: 50 steps,
+                # never validated - never quote a number from it.
+                torch.save({"model": model.state_dict(), "step": step,
+                            "epoch": epoch, "valid": None,
+                            "smoke": args.smoke,
+                            "arch": args.arch, "seed": args.seed},
+                           out / "best.pt")
+                print(f"[smoke] wrote {out / 'best.pt'} "
+                      f"(50-step probe checkpoint, not a result)")
                 return
             if args.max_steps and step >= args.max_steps:
                 break

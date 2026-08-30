@@ -83,6 +83,10 @@ def main():
     ap.add_argument("--tile-size", type=int, default=1008)
     ap.add_argument("--overlap", type=float, default=0.25)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="predict only the first N images (0 = all). Used by "
+                         "the smoke hour to exercise this path in minutes "
+                         "instead of on 108 full-resolution frames.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,6 +98,9 @@ def main():
     stride = max(1, int(round(args.tile_size * (1.0 - args.overlap))))
     img_dir = args.fold / args.split
     imgs = sorted(p for p in img_dir.iterdir() if p.suffix in EXTS)
+    if args.limit:
+        imgs = imgs[:args.limit]
+        print(f"--limit {args.limit}: predicting {len(imgs)} of the split")
     args.out.mkdir(parents=True, exist_ok=True)
     total_sec, total_tiles = 0.0, 0
     for i, p in enumerate(imgs):
@@ -116,7 +123,7 @@ def main():
         "run": str(args.run), "arch": ck.get("arch"),
         "seed": ck.get("seed"), "n_images": len(imgs),
         "tile_size": args.tile_size, "overlap": args.overlap,
-        "fusion": "mean", "threshold": 0.5,
+        "fusion": "mean", "threshold": 0.5, "limit": args.limit,
         "ms_per_tile": round(1000.0 * total_sec / max(total_tiles, 1), 2),
         "n_tiles": total_tiles}, indent=2))
 
