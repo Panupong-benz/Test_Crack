@@ -55,12 +55,18 @@ def main():
             state_f.write_text(json.dumps(state, indent=2))
             continue
         print(f"[run ] {name}: {job['cmd']}")
+        # breadcrumb for resource_monitor.py: which job the samples belong to.
+        # Safe for every other consumer - timing.csv / epoch_saturation read
+        # only keys ending in _hours.
+        state["_running"] = name
+        state_f.write_text(json.dumps(state, indent=2))
         t0 = time.time()
         with open(f"runs/{name}.log", "a", encoding="utf-8") as log:
             r = subprocess.run(job["cmd"], shell=True,
                                stdout=log, stderr=subprocess.STDOUT)
         state[name] = "ok" if r.returncode == 0 else f"exit{r.returncode}"
         state[f"{name}_hours"] = round((time.time() - t0) / 3600, 3)
+        state["_running"] = ""
         state_f.write_text(json.dumps(state, indent=2))
         print(f"[{state[name]:>4}] {name} ({state[f'{name}_hours']} h)")
         if r.returncode != 0 and not job.get("optional"):

@@ -271,6 +271,13 @@ def main():
         f"--models {' '.join(r for r in ALL_ROWS if r in rows)} "
         f"--strict", after=last,
         optional=True)
+    # resource usage summary (Amendment A1.9): peaks + MIN disk free = the
+    # number the next rental's container size comes from. Must be a queue job
+    # (poweroff fires before control returns to bash) and must precede collect
+    # so the summary lands inside the tar.
+    add("resource_report",
+        "python benchmark/resource_monitor.py --report", optional=True)
+
     # queue_runner --poweroff destroys the box right after the last job, so
     # the tarball MUST be the last job (Amendment A1.4) and it carries NO
     # "after": with `after: summarize` a failing summarize skipped the collect
