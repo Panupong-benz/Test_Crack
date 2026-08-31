@@ -815,6 +815,7 @@ class SAM3TrainerNative:
     def __init__(self, config_path, multi_gpu=False):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
+        self.config_path = str(config_path)   # recorded in run.json (A1.21)
 
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
@@ -1167,6 +1168,47 @@ class SAM3TrainerNative:
         # Create output directory
         out_dir = Path(self.config["output"]["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        restarts = 0
+        if is_main_process():
+            # A1.21 item 111: val_stats.json is appended per epoch and this
+            # trainer has no --resume, so a retried job would CONCATENATE two
+            # runs' curves (measured: best_epoch 12 read as 21, verdict
+            # unchanged) while best_val_loss=inf below lets the retry
+            # overwrite best_lora_weights.pt even when the dead attempt was
+            # better. Rotating both files does not prevent the overwrite -
+            # it makes it CORRECT, by restoring the invariant
+            # "best_lora_weights.pt = argmin of val_stats.json".
+            # (Rejected alternative: seeding best_val_loss from the old file
+            # would pair attempt 1's weights with attempt 2's curve - the
+            # exact decoupling being removed.)
+            stats_f = out_dir / "val_stats.json"
+            if stats_f.exists() and stats_f.stat().st_size > 0:
+                k = 1
+                while (out_dir / f"val_stats.prev{k}.json").exists():
+                    k += 1
+                restarts = k
+                stats_f.rename(out_dir / f"val_stats.prev{k}.json")
+                best_f = out_dir / "best_lora_weights.pt"
+                if best_f.exists():
+                    best_f.rename(out_dir / f"best_lora_weights.prev{k}.pt")
+                print(f"[restart] rotated stale val_stats.json"
+                      f"{' + best_lora_weights.pt' if (out_dir / f'best_lora_weights.prev{k}.pt').exists() else ''}"
+                      f" -> .prev{k} (attempt {k + 1} starts a fresh curve)")
+            # A1.21 item 112: the budget travels WITH the run. budget_row
+            # checks run.json before the per-run YAML, so epoch_saturation
+            # no longer depends on a gitignored config surviving the tarball.
+            _tr = self.config["training"]
+            (out_dir / "run.json").write_text(json.dumps({
+                "epochs": epochs,
+                "batch": int(_tr.get("batch_size", 0)),
+                "grad_accum": int(_tr.get("gradient_accumulation_steps", 1)),
+                "n_train_tiles": len(train_ds),
+                "n_val_tiles": len(val_ds) if has_validation else 0,
+                "seed": int(_tr.get("seed", 42)),
+                "config_path": self.config_path,
+                "restarts": restarts,
+            }, indent=2))
 
         for epoch in range(epochs):
             # Set epoch for distributed / weighted samplers (per-epoch reshuffle)

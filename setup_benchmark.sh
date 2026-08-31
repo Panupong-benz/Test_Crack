@@ -278,6 +278,10 @@ python3 benchmark/to_nnunet.py --selftest || die "to_nnunet selftest FAILED"
 # raw 40x20 FAILS where oriented 20x40 passes - a green line here proves the
 # gate can detect, not merely that it ran (A1.11).
 python3 benchmark/check_images.py --selftest || die "check_images selftest FAILED"
+# prefix-property guard (A1.21 item 115): budget/checkpoint claims rest on
+# the trainer having NO LR scheduler - a shorter run must be a prefix of a
+# longer one. Milliseconds, no torch.
+python3 benchmark/check_prefix_property.py || die "prefix-property guard FAILED"
 
 echo -e "\nsetup_benchmark complete. Next - INTERIM SCOPE (A6 seed 0 + A5, Amendment A1.8):"
 echo "  1. bash run_benchmark.sh smoke-a6     # ~15 min: pipe + s/step for the hour estimate"

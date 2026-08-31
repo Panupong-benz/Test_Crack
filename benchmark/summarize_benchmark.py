@@ -178,10 +178,27 @@ PIXEL_GROUP = ["pixel_iou", "f1"]
 SKEL_GROUP = ["cldice", "cliou_4px"]
 
 
-def load_budget_limited(results: Path) -> dict:
-    """{model: "k/n"} for rows that hit their epoch ceiling, from
-    epoch_saturation.csv (written by benchmark/epoch_saturation.py against a
-    criterion pre-registered in that file's docstring).
+def _fold_from_run(run: str, model: str) -> str:
+    """a6_RW20_s0 -> RW20; a5_RW20 -> RW20. Fallback for saturation CSVs
+    written before the fold column existed."""
+    stem = run[len(model) + 1:] if model and run.startswith(model + "_") \
+        else run
+    return re.sub(r"_s\d+$", "", stem)
+
+
+def load_budget_limited(results: Path):
+    """Reads epoch_saturation.csv (criterion pre-registered in that file's
+    docstring) and returns FOUR things (A1.21 items 112/113):
+
+      by_model  {model: "k/n"}            - the POOLED row's mark
+      by_fold   {(model, fold): "k/n"}    - each fold row gets its OWN
+                verdict; stamping the model-level k/n on fold rows let a
+                clean fold claim its siblings' failures
+      epochs    {(model, fold): set[int]} - budget per fold, so a mixed
+                budget is a visible column, never a silent property
+      unknown   [run, ...] rows with budget_known == 0 - judged against
+                their own logged length (the budget-or-n fallback);
+                --strict refuses a table built on them
 
     The mark belongs IN the table: a footnote is not what a reader remembers,
     and a row that was still improving when its budget ran out is reporting a
@@ -189,13 +206,28 @@ def load_budget_limited(results: Path) -> dict:
     job is optional and the table must still build without it."""
     fp = results / "epoch_saturation.csv"
     if not fp.exists():
-        return {}
-    tally = {}
+        return {}, {}, {}, []
+    t_model, t_fold, epochs, unknown = {}, {}, {}, []
     with open(fp, encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
-            n, k = tally.get(r["model"], (0, 0))
-            tally[r["model"]] = (n + 1, k + (r["verdict"] == "budget_limited"))
-    return {m: f"{k}/{n}" for m, (n, k) in tally.items() if k}
+            m = r.get("model", "")
+            fold = r.get("fold") or _fold_from_run(r.get("run", ""), m)
+            v = r.get("verdict", "")
+            n, k = t_model.get(m, (0, 0))
+            t_model[m] = (n + 1, k + (v == "budget_limited"))
+            if fold:
+                n, k = t_fold.get((m, fold), (0, 0))
+                t_fold[(m, fold)] = (n + 1, k + (v == "budget_limited"))
+                b = (r.get("budget_epochs") or "").strip()
+                if b.isdigit():
+                    epochs.setdefault((m, fold), set()).add(int(b))
+            if r.get("budget_known") == "0":
+                unknown.append(r.get("run", ""))
+
+    def fmt(d):
+        return {key: f"{k}/{n}" for key, (n, k) in d.items() if k}
+
+    return fmt(t_model), fmt(t_fold), epochs, unknown
 
 
 def write_axis_b(results: Path, pooled_by_model: dict, out_csv: Path):
@@ -321,7 +353,9 @@ def main(argv=None):
         return 1
 
     incomplete = []
-    budget_limited = load_budget_limited(args.results)
+    (budget_limited, bl_fold, epochs_by_mf,
+     unknown_budget) = load_budget_limited(args.results)
+    mixed_models = {}     # {model: (min, max)} when folds disagree
     table_rows = []          # main_table.csv rows (NUMERIC long format)
     long_rows = []           # plot_data_long.csv rows (raw values)
     md = ["| model | scope | " + " | ".join(HEADERS)
@@ -412,6 +446,18 @@ def main(argv=None):
         # (model, scope, metric); intervals as separate columns per the
         # repo convention (never a formatted "0.42 (0.41-0.44)" string)
         first_row_of_model = True
+        _eps = sorted({e for f_ in args.folds
+                       for e in epochs_by_mf.get((model, f_), set())})
+        if len(_eps) > 1:
+            mixed_models[model] = (_eps[0], _eps[-1])
+
+        def _epochs_cell(scope):
+            if scope == "POOLED":
+                if len(_eps) > 1:
+                    return f"{_eps[0]}-{_eps[-1]}"
+                return str(_eps[0]) if _eps else ""
+            v = sorted(epochs_by_mf.get((model, scope), set()))
+            return "/".join(str(x) for x in v)
 
         def num_rows(scope, vals_by_metric):
             nonlocal first_row_of_model
@@ -427,7 +473,13 @@ def main(argv=None):
                     "params": p_num if first_row_of_model else "",
                     "gflops": g_num if first_row_of_model else "",
                     "ms_per_tile": ms_num if first_row_of_model else "",
-                    "budget_limited": budget_limited.get(model, "")})
+                    # fold rows carry the fold's OWN verdict; the model-level
+                    # k/n belongs to POOLED only (A1.21 item 113 - the old
+                    # code let a clean fold claim its siblings' failures)
+                    "budget_limited": (budget_limited.get(model, "")
+                                       if scope == "POOLED"
+                                       else bl_fold.get((model, scope), "")),
+                    "epochs": _epochs_cell(scope)})
                 first_row_of_model = False
 
         for fold in args.folds:
@@ -446,6 +498,9 @@ def main(argv=None):
         pcells = [med_range(pooled_vals[m]) for m in METRICS]
         bl = budget_limited.get(model)
         label_md = f"{label} (budget-limited {bl})" if bl else label
+        if model in mixed_models:
+            mn, mx = mixed_models[model]
+            label_md += f" (MIXED epoch budget {mn}-{mx})"
         md.append(f"| {label_md} | POOLED{status} | " + " | ".join(pcells)
                   + f" | {p_str} | {ms_str} |")
 
@@ -459,7 +514,8 @@ def main(argv=None):
     out = args.results
     out.mkdir(parents=True, exist_ok=True)
     fields = ["model", "scope", "metric", "median", "min", "max",
-              "n_seeds", "params", "gflops", "ms_per_tile", "budget_limited"]
+              "n_seeds", "params", "gflops", "ms_per_tile", "budget_limited",
+              "epochs"]
     with open(out / "main_table.csv", "w", newline="",
               encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -502,6 +558,19 @@ def main(argv=None):
             return 1
     else:
         print("\nall expected runs present")
+    # A1.21: a per-fold epoch-budget difference is a protocol property that
+    # must never be discoverable only from the raw configs; and a row whose
+    # budget fell back to its own logged length has no adequacy evidence.
+    if mixed_models:
+        print("MIXED epoch budgets: " + ", ".join(
+            f"{m} {mn}-{mx}" for m, (mn, mx) in sorted(mixed_models.items())))
+        if args.strict:
+            return 1
+    if unknown_budget:
+        print("UNKNOWN budget (budget-or-n fallback) on: "
+              + ", ".join(sorted(unknown_budget)))
+        if args.strict:
+            return 1
     print(f"wrote main_table.csv (numeric)/.md, plot_data_long.csv, "
           f"per_image_metrics.csv, timing.csv, a5_vs_a6.csv, "
           f"seed_variance.csv, summary_all.json -> {out}")
@@ -625,13 +694,67 @@ def selftest():
               "--seeds", *map(str, seeds)])
         mt3 = list(csv.DictReader(open(res / "main_table.csv")))
         a6r = [r for r in mt3 if r["model"] == "a6"]
-        assert a6r and all(r["budget_limited"] == "1/2" for r in a6r), a6r
+        # A1.21 item 113: the POOLED row carries the model-level k/n; a fold
+        # row carries its OWN verdict (F1 was the budget_limited one), and a
+        # clean fold no longer claims its sibling's failure
+        assert a6r and all(r["budget_limited"] == "1/2" for r in a6r
+                           if r["scope"] == "POOLED"), a6r
+        assert all(r["budget_limited"] == "1/1" for r in a6r
+                   if r["scope"] == "F1"), a6r
+        assert all(r["budget_limited"] == "" for r in a6r
+                   if r["scope"] == "F2"), a6r
+        assert all("epochs" in r for r in mt3), "epochs column missing"
         assert all(r["budget_limited"] == "" for r in mt3
                    if r["model"] == "a5"), "a5 had no budget_limited run"
         for r in mt3:                    # the guard that matters for plotting
             float(r["median"]), float(r["min"]), float(r["max"])
         md_txt = (res / "main_table.md").read_text(encoding="utf-8")
         assert "(budget-limited 1/2)" in md_txt, md_txt
+        assert "MIXED" not in md_txt, "no budgets planted, no MIXED label"
+
+        # A1.21 item 113: a mixed budget must surface as a column, an md
+        # label, and a --strict failure - never as a silent property
+        with open(res / "epoch_saturation.csv", "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=[
+                "run", "model", "fold", "verdict", "budget_epochs",
+                "budget_known"])
+            w.writeheader()
+            w.writerow({"run": "a6_F1_s0", "model": "a6", "fold": "F1",
+                        "verdict": "saturated", "budget_epochs": "30",
+                        "budget_known": "1"})
+            w.writerow({"run": "a6_F2_s0", "model": "a6", "fold": "F2",
+                        "verdict": "saturated", "budget_epochs": "20",
+                        "budget_known": "1"})
+        rc = main(["--results", str(res), "--folds", *folds,
+                   "--seeds", *map(str, seeds)])
+        assert rc == 0, "mixture alone must not fail a non-strict build"
+        md_txt = (res / "main_table.md").read_text(encoding="utf-8")
+        assert "(MIXED epoch budget 20-30)" in md_txt, md_txt
+        mt4 = list(csv.DictReader(open(res / "main_table.csv")))
+        pooled_a6 = next(r for r in mt4 if r["model"] == "a6"
+                         and r["scope"] == "POOLED")
+        assert pooled_a6["epochs"] == "20-30", pooled_a6
+        f1_a6 = next(r for r in mt4 if r["model"] == "a6"
+                     and r["scope"] == "F1")
+        assert f1_a6["epochs"] == "30", f1_a6
+        rc = main(["--results", str(res), "--folds", *folds,
+                   "--seeds", *map(str, seeds), "--strict"])
+        assert rc == 1, "--strict must refuse a mixed-budget table"
+
+        # and a budget-or-n fallback row must fail --strict too
+        with open(res / "epoch_saturation.csv", "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=[
+                "run", "model", "fold", "verdict", "budget_epochs",
+                "budget_known"])
+            w.writeheader()
+            w.writerow({"run": "a6_F1_s0", "model": "a6", "fold": "F1",
+                        "verdict": "saturated", "budget_epochs": "",
+                        "budget_known": "0"})
+        rc = main(["--results", str(res), "--folds", *folds,
+                   "--seeds", *map(str, seeds), "--strict"])
+        assert rc == 1, "--strict must refuse an unknown-budget table"
         (res / "epoch_saturation.csv").unlink()
 
         # axis B: its own table, and it must NOT leak into main_table

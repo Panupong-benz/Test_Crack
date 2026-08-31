@@ -73,6 +73,14 @@ def main():
     ap.add_argument("--batch", type=int, default=8,
                     help="A2-A4 batch size (from the smoke-hour sweep)")
     ap.add_argument("--epochs", type=int, default=40, help="A2-A4 epochs")
+    ap.add_argument("--a6-epochs", type=int, default=None,
+                    help="A6 num_epochs override; default None = the base "
+                         "config's value (30). Exists for REPRODUCIBILITY, "
+                         "not budget cutting (A1.21 item 114): "
+                         "configs/benchmark/ is gitignored, so the budget "
+                         "must live in a committable command - a hand-"
+                         "edited YAML is silently erased by the next "
+                         "make_jobs run.")
     ap.add_argument("--marked-list", default="marked_line_images.txt")
     ap.add_argument("--results", default="results/benchmark")
     ap.add_argument("--nnunet-id-base", type=int, default=501)
@@ -148,6 +156,10 @@ def main():
         tag = f"a6_{fold}_s{seed}"
         cfg = override_keys(base_cfg, f"{args.data_root}/fold_{fold}",
                             seed, f"runs/{tag}")
+        if args.a6_epochs:
+            # set AFTER override_keys - its key-name walk would clobber every
+            # num_epochs in the tree (A1.21 item 114)
+            cfg["training"]["num_epochs"] = int(args.a6_epochs)
         cfg_path = args.config_dir / f"{tag}.yaml"
         cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False),
                             encoding="utf-8")

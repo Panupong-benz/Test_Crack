@@ -154,20 +154,44 @@ def read_valid_log(run: Path):
 
 
 def read_val_stats(run: Path):
-    """A6: JSONL of {epoch, train_loss, val_loss} — lower better."""
+    """A6: JSONL of {epoch, train_loss, val_loss} — lower better.
+
+    Returns (vals, meta). The trainer appends per epoch and (before A1.21)
+    never rotated, so a retried fold CONCATENATED two runs' curves - measured:
+    an attempt dead at epoch 9 plus a full retry turned best_epoch 12 into 21
+    with the verdict unchanged. The frozen criterion says "the run's
+    validation curve"; a concatenation was never that, so keeping only the
+    LAST contiguous epoch block is a reading-bug fix, not a criterion change
+    (A1.21 item 111). What was discarded is reported, never hidden:
+    meta = {"restarts": blocks - 1, "epochs_discarded": len of earlier blocks}.
+    """
     fp = run / "val_stats.json"
     if not fp.exists():
-        return None
-    out = []
+        return None, {}
+    recs = []
     for line in fp.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            out.append(float(json.loads(line)["val_loss"]))
+            j = json.loads(line)
+            recs.append((int(j.get("epoch", len(recs) + 1)),
+                         float(j["val_loss"])))
         except (ValueError, KeyError, TypeError):
             continue
-    return out
+    blocks, cur, last_e = [], [], 0
+    for e, v in recs:
+        if e <= last_e and cur:          # epoch number reset = a new attempt
+            blocks.append(cur)
+            cur = []
+        cur.append(v)
+        last_e = e
+    if cur:
+        blocks.append(cur)
+    vals = blocks[-1] if blocks else []
+    meta = {"restarts": max(0, len(blocks) - 1),
+            "epochs_discarded": sum(len(b) for b in blocks[:-1])}
+    return vals, meta
 
 
 def read_nnunet_log(results_root: Path | None, fold: str):
@@ -199,17 +223,21 @@ def budget_row(run: Path, model: str, cfg_dir: Path, hours):
            "grad_accum": "", "n_train_tiles": "", "optimizer_steps": "",
            "samples_seen": "", "hours": hours if hours is not None else ""}
     rj = run / "run.json"
-    if rj.exists():                                    # A2-A4
+    if rj.exists():                        # A2-A4, and A6 since A1.21 item 112
         try:
             j = json.loads(rj.read_text(encoding="utf-8"))
         except ValueError:
             j = {}
         ep, bs = j.get("epochs"), j.get("batch")
         tiles = j.get("n_train_tiles")
-        row.update(epochs=ep or "", batch=bs or "", grad_accum=1,
-                   n_train_tiles=tiles or "")
+        # A6 accumulates gradients: (tiles // bs) counts MICRO-steps, so
+        # divide by grad_accum or A6's ~12,200 optimizer steps would be
+        # reported as ~97,600. A2-A4 run.json has no grad_accum key -> 1.
+        acc = int(j.get("grad_accum", 1) or 1)
+        row.update(epochs=ep or "", batch=bs or "", grad_accum=acc,
+                   n_train_tiles=tiles or "", budget_source="run.json")
         if ep and bs and tiles:
-            row["optimizer_steps"] = (tiles // bs) * ep
+            row["optimizer_steps"] = (tiles // bs) * ep // acc
             row["samples_seen"] = tiles * ep
         return row
     cfg = cfg_dir / f"{run.name}.yaml"                 # A6
@@ -222,13 +250,17 @@ def budget_row(run: Path, model: str, cfg_dir: Path, hours):
         tr = (c or {}).get("training", {}) or {}
         dl = (c or {}).get("dataloader", {}) or (c or {}).get("data", {}) or {}
         ep = tr.get("num_epochs")
-        bs = dl.get("batch_size") or (c or {}).get("batch_size")
+        # A6 keeps batch_size under training:, which the old lookup never
+        # checked - the column was blank on every A6 row (A1.21 item 113)
+        bs = (tr.get("batch_size") or dl.get("batch_size")
+              or (c or {}).get("batch_size"))
         acc = tr.get("gradient_accumulation_steps") or 1
-        row.update(epochs=ep or "", batch=bs or "", grad_accum=acc)
+        row.update(epochs=ep or "", batch=bs or "", grad_accum=acc,
+                   budget_source="config")
         return row
     if model == "a1":                                  # nnU-Net, fixed by it
         row.update(epochs=250, batch="self-config", grad_accum=1,
-                   optimizer_steps=250 * 250)
+                   optimizer_steps=250 * 250, budget_source="a1-fixed")
     return row
 
 
@@ -252,27 +284,54 @@ def collect(runs_dir: Path, results: Path, cfg_dir: Path,
         model, fold, seed = m.group(1), m.group(2), m.group(3)
         if model == "a5":
             continue                                   # zero-shot, no training
-        budgets.append(budget_row(run, model, cfg_dir, hours.get(run.name)))
+        brow = budget_row(run, model, cfg_dir, hours.get(run.name))
+        budgets.append(brow)
 
+        meta = {}
         if model in ("unet", "deeplabv3p", "segformer"):
             vals, higher = read_valid_log(run), True
         elif model == "a6":
-            vals, higher = read_val_stats(run), False
+            vals, meta = read_val_stats(run)
+            higher = False
         else:                                          # a1
             vals, higher = read_nnunet_log(nnunet_results, fold), True
 
-        budget = next((b["epochs"] for b in budgets if b["run"] == run.name),
-                      None)
-        r = judge(vals or [], budget if isinstance(budget, int) else 0, higher)
+        budget = brow["epochs"]
+        bknown = 1 if isinstance(budget, int) and budget > 0 else 0
+        if not bknown and vals:
+            # A1.21 item 112: with no budget, judge() falls back to the
+            # logged length, under which clause 1 passes for almost any
+            # curve. The fallback stays (changing it would change the frozen
+            # criterion's output) but it must never be silent, and summarize
+            # --strict refuses a table built on it.
+            print(f"WARN {run.name}: budget unknown (no run.json and no "
+                  f"config) - verdict is judged against the logged length, "
+                  f"which biases toward 'saturated'")
+        r = judge(vals or [], budget if bknown else 0, higher)
         if model == "a1" and r["verdict"] != "no_log":
             r["verdict"] = "weak_evidence"             # -f all: no held-out val
+        restarts = int(meta.get("restarts", 0))
+        curve_ok = 1 if (restarts == 0 and not (
+            bknown and r.get("epochs_logged", 0) > budget)) else 0
         rows.append({"run": run.name, "model": model, "fold": fold,
-                     "seed": seed if seed is not None else "", **r})
+                     "seed": seed if seed is not None else "", **r,
+                     "restarts": restarts,
+                     "epochs_discarded": meta.get("epochs_discarded", 0),
+                     "curve_ok": curve_ok,
+                     "budget_source": brow.get("budget_source", ""),
+                     "budget_known": bknown})
 
     results.mkdir(parents=True, exist_ok=True)
     fields = ["run", "model", "fold", "seed", "verdict", "epochs_logged",
               "budget_epochs", "best_epoch", "best_frac", "N", "total_gain",
-              "tail_gain", "rel_tail_gain", "clause1", "clause2"]
+              "tail_gain", "rel_tail_gain", "clause1", "clause2",
+              # A1.21: transparency columns, NOT new verdicts - the verdict
+              # set is frozen. restarts/epochs_discarded say what the reader
+              # had to discard; curve_ok=0 flags a file that was not a single
+              # clean run; budget_source/budget_known expose the budget-or-n
+              # fallback instead of letting it pass as a real budget.
+              "restarts", "epochs_discarded", "curve_ok",
+              "budget_source", "budget_known"]
     with open(results / "epoch_saturation.csv", "w", newline="",
               encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
@@ -283,7 +342,7 @@ def collect(runs_dir: Path, results: Path, cfg_dir: Path,
         w = csv.DictWriter(fh, fieldnames=["run", "model", "epochs", "batch",
                                            "grad_accum", "n_train_tiles",
                                            "optimizer_steps", "samples_seen",
-                                           "hours"])
+                                           "hours", "budget_source"])
         w.writeheader()
         w.writerows(budgets)
     return rows
@@ -362,9 +421,62 @@ def selftest():
         b0 = next(b for b in bt if b["run"] == "unet_F1_s0")
         assert int(b0["optimizer_steps"]) == (800 // 8) * B, b0
         assert int(b0["samples_seen"]) == 800 * B, b0
+    # A1.21: a retried A6 fold concatenates val_stats.json. The reader must
+    # keep only the last contiguous block and SAY what it discarded.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        runs = root / "runs"
+
+        def write_stats(d, curves):
+            lines = []
+            for c in curves:
+                for i, v in enumerate(c, 1):
+                    lines.append(json.dumps(
+                        {"epoch": i, "train_loss": v, "val_loss": v}))
+            (d / "val_stats.json").write_text("\n".join(lines) + "\n")
+
+        # the dead attempt reached a LOWER loss (10.0) than the real run's
+        # best (~40 at epoch 12): the old reader would report the ghost
+        dead = [300.0 - 30 * i for i in range(9)]
+        dead[-1] = 10.0
+        real = [300 * 0.82 ** min(i, 12) + 40 for i in range(1, 31)]
+        d1 = runs / "a6_F1_s0"
+        d1.mkdir(parents=True)
+        (d1 / "run.json").write_text(json.dumps(
+            {"epochs": 30, "batch": 2, "grad_accum": 8,
+             "n_train_tiles": 6000}))
+        write_stats(d1, [dead, real])
+        d2 = runs / "a6_F2_s0"                # no run.json, no config -> WARN
+        d2.mkdir(parents=True)
+        write_stats(d2, [real])
+        res = root / "res"
+        rows2 = collect(runs, res, root / "cfg", root / "queue_state.json",
+                        None)
+        r1 = next(r for r in rows2 if r["run"] == "a6_F1_s0")
+        assert r1["restarts"] == 1 and r1["epochs_discarded"] == 9, r1
+        assert r1["curve_ok"] == 0, r1
+        assert r1["epochs_logged"] == 30 and r1["budget_epochs"] == 30, r1
+        assert r1["best_epoch"] == 12, (
+            "best must come from the LAST block, not the dead attempt's "
+            "ghost minimum", r1)
+        assert r1["verdict"] in ("saturated", "budget_limited",
+                                 "degenerate"), r1
+        assert r1["budget_source"] == "run.json" and r1["budget_known"] == 1
+        r2 = next(r for r in rows2 if r["run"] == "a6_F2_s0")
+        assert r2["budget_known"] == 0 and r2["budget_source"] == "", r2
+        assert r2["restarts"] == 0 and r2["curve_ok"] == 1, r2
+        bt2 = list(csv.DictReader(open(res / "budget_table.csv",
+                                       encoding="utf-8")))
+        b1 = next(b for b in bt2 if b["run"] == "a6_F1_s0")
+        assert int(b1["optimizer_steps"]) == (6000 // 2) * 30 // 8, (
+            "grad_accum must divide micro-steps", b1)
+        assert b1["budget_source"] == "run.json", b1
     print("selftest PASS: saturated / budget_limited / creeping->saturated "
           "(OR, not AND) / degenerate; mirrored for lower-is-better; "
-          "N=3,4,25 for B=30,40,250; end-to-end runs/ scan + budget maths")
+          "N=3,4,25 for B=30,40,250; end-to-end runs/ scan + budget maths; "
+          "concatenated curve -> last block only (restarts=1, curve_ok=0, "
+          "ghost minimum ignored); unknown budget -> budget_known=0 + WARN; "
+          "a6 optimizer steps divided by grad_accum")
     return 0
 
 

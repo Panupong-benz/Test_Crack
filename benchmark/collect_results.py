@@ -57,7 +57,10 @@ SPEC = [
     (REPO / "runs", "*/run.json", False),
     (REPO / "runs", "*/train_log.csv", False),
     (REPO / "runs", "*/valid_log.csv", False),
-    (REPO / "runs", "*/val_stats.json", False),
+    # val_stats*.json: the trainer rotates a retried attempt's log to
+    # val_stats.prev<k>.json (A1.21 item 111) - the only surviving record
+    # that a restart happened. A few KB each.
+    (REPO / "runs", "*/val_stats*.json", False),
     (REPO / "runs", "*/DONE", False),
     (REPO / "runs", "*/best.pt", False),
     (REPO / "runs", "*/best_lora_weights.pt", False),
@@ -68,7 +71,12 @@ SPEC = [
     (REPO / "runs", "*/last_lora_weights.pt", False),
     (REPO / "runs", "*/masks/**/*", True),
     (REPO / "runs", "*.log", True),
-    (REPO / "configs" / "benchmark", "*.yaml", False),
+    # A1.21 item 110: the root must be REPO, not configs/benchmark - the
+    # arcname is p.relative_to(root.parent), so the old entry unpacked the
+    # A6 configs at benchmark/a6_*.yaml (colliding with the CODE namespace)
+    # and epoch_saturation --config-dir configs/benchmark found nothing,
+    # silently biasing every A6 row toward "saturated" via budget-or-n.
+    (REPO, "configs/benchmark/*.yaml", False),
     (REPO, "jobs.yaml", False),
     (REPO, "queue_state.json", True),
     (REPO, "QUEUE_DONE", False),
