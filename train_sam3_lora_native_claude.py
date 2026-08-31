@@ -980,6 +980,11 @@ class SAM3TrainerNative:
         torch.cuda.manual_seed_all(_seed)
         print(f"[seed] all RNGs seeded with {_seed}")
 
+        # A1.20: input is a fixed 1008x1008 tile on every step, which is
+        # exactly the case cudnn autotuning exists for. benchmark/train_seg.py
+        # has had this since A1.4; the A6 trainer never got it.
+        torch.backends.cudnn.benchmark = True
+
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
 
@@ -1081,6 +1086,13 @@ class SAM3TrainerNative:
                 )
 
         _nw = int(self.config["training"].get("num_workers", 0))
+        # No worker_init_fn, deliberately (A1.20 item 105 RETRACTED): torch 2.x
+        # already derives a distinct numpy seed per worker from the DataLoader's
+        # base_seed - see torch/utils/data/_utils/worker.py, which calls
+        # np.random.seed(_generate_state(base_seed, worker_id)) precisely "to
+        # prevent state collision". base_seed is drawn from the global torch RNG,
+        # which is seeded above, so augmentation is BOTH decorrelated across
+        # workers AND reproducible. Verified empirically on torch 2.6.
         _loader_kwargs = dict(
             collate_fn=collate_fn,
             num_workers=_nw,

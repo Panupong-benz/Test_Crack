@@ -73,7 +73,9 @@ training:
 
   batch_size: 2      # Increased from 1 to reduce gradient variance
   num_workers: 4        # Increase for better data loading
-  prefetch_factor: 2    # Per-worker prefetch (only used when num_workers > 0)
+  prefetch_factor: 4    # Per-worker prefetch (only used when num_workers > 0).
+                        # 4 since A1.20, matching benchmark/seg_dataset.py at the
+                        # same tile size; A6 had been left at 2.
 
   # Tile-based training: crop native-resolution tiles instead of downscaling
   # whole-wall photos to 1008. Hairline cracks (1-3 px in the camera image)
@@ -153,5 +155,10 @@ evaluation:
 
 hardware:
   device: "cuda"
-  dataloader_pin_memory: true
+  dataloader_pin_memory: true   # DEAD: pin_memory is hardcoded True in the trainer
   use_compile: false
+  # A1.20: the trainer reads this with default True, and until now NO config
+  # set it - so the allocator was flushed 376x/epoch on a 32 GB 5090 despite
+  # the code comment claiming "the 5090 benchmark configs set it false".
+  # The trainer prices the flush at 10-30%.
+  empty_cache_every_step: false

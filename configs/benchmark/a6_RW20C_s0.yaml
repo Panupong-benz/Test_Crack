@@ -1,0 +1,81 @@
+model:
+  name: facebook/sam3
+  cache_dir: null
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - out_proj
+  - qkv
+  - proj
+  - fc1
+  - fc2
+  - c_fc
+  - c_proj
+  - linear1
+  - linear2
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: true
+  apply_to_geometry_encoder: true
+  apply_to_detr_encoder: true
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+training:
+  data_dir: data/fold_RW20C
+  checkpoint_path: /root/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt
+  batch_size: 2
+  num_workers: 4
+  prefetch_factor: 4
+  tiling:
+    enabled: true
+    tile_size: 1008
+    overlap: 0.25
+    min_crack_pixels: 0
+    random_offset: true
+    augment: true
+    image_cache_size: 8
+  sampling:
+    enabled: true
+    num_bins: 5
+    power: 1.0
+    empty_tile_weight: 0.1
+    num_samples: null
+  cldice:
+    iters: 3
+    max_size: 384
+    use_checkpoint: true
+  learning_rate: 5e-5
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+  num_epochs: 30
+  warmup_steps: 100
+  lr_scheduler: cosine
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 5
+  mixed_precision: bf16
+  seed: 0
+  gradient_accumulation_steps: 8
+output:
+  output_dir: runs/a6_RW20C_s0
+  logging_dir: logs
+  save_lora_only: true
+  push_to_hub: false
+  hub_model_id: null
+evaluation:
+  metric: iou
+  save_predictions: false
+  compute_metrics_during_training: true
+hardware:
+  device: cuda
+  dataloader_pin_memory: true
+  use_compile: false
+  empty_cache_every_step: false

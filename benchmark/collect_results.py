@@ -61,6 +61,11 @@ SPEC = [
     (REPO / "runs", "*/DONE", False),
     (REPO / "runs", "*/best.pt", False),
     (REPO / "runs", "*/best_lora_weights.pt", False),
+    # A1.20 item 107: the A6 trainer has NO --resume, so a fold killed
+    # mid-training restarts at epoch 0 - and if it is killed before its
+    # first validation epoch completes, best_lora_weights.pt does not
+    # exist yet and last_* is the only surviving LoRA. 74 MB/fold.
+    (REPO / "runs", "*/last_lora_weights.pt", False),
     (REPO / "runs", "*/masks/**/*", True),
     (REPO / "runs", "*.log", True),
     (REPO / "configs" / "benchmark", "*.yaml", False),
