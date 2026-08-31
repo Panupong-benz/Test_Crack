@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-# tile_dataset.py lives in one of two layouts (byte-identical modulo CRLF,
+# tile_dataset.py lives in one of two layouts (byte-identical modulo CRLF; re-verified 2026-08-31 after the A1.16 tqdm,
 # verified 2026-08-28):
 #   local  : <thesis>/04_models/Result_Coding/22.4.2025/  (canonical, CLAUDE.md SS4)
 #   vast.ai: Test_Crack repo root (this benchmark/ dir sits inside the clone)

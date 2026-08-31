@@ -63,7 +63,11 @@ def convert(fold: Path, dataset_id: int, name: str, raw: Path) -> Path:
     n_tr = 0
     for split in ("train", "valid"):
         gts = load_gt_masks(fold / split)
-        for nm, gt in sorted(gts.items()):
+        for _j, (nm, gt) in enumerate(sorted(gts.items()), 1):
+            # per-image counter (A1.16): thousands of 1008px tiles per
+            # fold were written in silence
+            print(f"\r[{split} {_j}/{len(gts)}] {nm[:60]:<60}",
+                  end="", flush=True)
             img = cv2.imread(str(fold / split / nm))
             if img is None:
                 print(f"WARNING missing image {split}/{nm}")
@@ -94,7 +98,7 @@ def convert(fold: Path, dataset_id: int, name: str, raw: Path) -> Path:
         "numTraining": n_tr,
         "file_ending": ".png",
     }, indent=2))
-    print(f"{ds}: {n_tr} training tiles, {len(gts_ts)} test frames")
+    print(f"\n{ds}: {n_tr} training tiles, {len(gts_ts)} test frames")
     return ds
 
 

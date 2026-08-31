@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 # infer_sam.py: code/ subdir in the local thesis tree, repo root on a
-# Test_Crack clone (byte-identical modulo CRLF, verified 2026-08-28)
+# Test_Crack clone (byte-identical modulo CRLF, verified 2026-08-28; re-verified 2026-08-31 after A1.16)
 _ROOT = Path(__file__).resolve().parents[1]
 for INFER in (_ROOT / "code" / "infer_sam.py", _ROOT / "infer_sam.py"):
     if INFER.exists():
@@ -80,7 +80,11 @@ def main():
         dt = time.time() - t0
         secs.append(round(dt, 2))
         status = "ok" if r.returncode == 0 else "FAIL"
-        print(f"[{i + 1}/{len(imgs)}] {img.name}: {status}  {dt:.1f}s")
+        _el = time.time() - t_all
+        _eta = (_el / (i + 1)) * (len(imgs) - i - 1)
+        print(f"[{i + 1}/{len(imgs)}] {img.name}: {status}  {dt:.1f}s  "
+              f"(elapsed {int(_el) // 60}m{int(_el) % 60:02d}s, "
+              f"ETA {int(_eta) // 60}m{int(_eta) % 60:02d}s)", flush=True)
         if r.returncode != 0:
             failures.append({"image": img.name,
                              "tail": (r.stderr or r.stdout)[-400:]})

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -151,7 +152,16 @@ def run_eval(gt_dir: Path, pred_dir: Path, out_csv: Path,
                cl_tp=0, cl_fp=0, cl_fn=0, marked_fp=0, marked_pixels=0)
     per_image = []
     missing = []
-    for name, gt in sorted(gts.items()):
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **k):
+            return it
+    # stderr bar (A1.16): up to 108 full-res skeletonize+dilate passes ran
+    # in total silence. Nothing parses stdout structurally (summarize reads
+    # eval_*.summary.json) and stderr merges into the queue log anyway.
+    for name, gt in _tqdm(sorted(gts.items()), desc="eval", unit="img",
+                          mininterval=1.0, file=sys.stderr, disable=False):
         stem = Path(name).stem
         # "_mask.png" FIRST and deliberately: infer_sam writes the binary
         # prediction as {stem}_mask.png and an RGB matplotlib OVERLAY as

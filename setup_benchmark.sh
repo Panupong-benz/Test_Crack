@@ -138,6 +138,7 @@ else
   Almost always a Drive permission page, not a zip: set the file sharing
   to 'Anyone with the link' and re-run, or upload it by hand to $WORK."
   fi
+  echo "hashing $(du -h "$POOL_ZIP" | cut -f1) pool archive (~5-15 s, silent)"
   got=$(md5sum "$POOL_ZIP" | cut -d' ' -f1)
   echo "$(basename "$POOL_ZIP") md5 = $got   (expected: $POOLBM_MD5)"
   if [ "$POOLBM_MD5" != "TBD-at-freeze" ] && [ "$got" != "$POOLBM_MD5" ]; then
@@ -152,7 +153,25 @@ else
   [ "$POOLBM_MD5" = "TBD-at-freeze" ] && \
     echo "WARN: POOLBM_MD5 not set - running unfrozen data (smoke only!)"
   # python zipfile: works before apt has installed unzip
-  python3 -m zipfile -e "$POOL_ZIP" "$WORK/pool_extract" || die "unzip failed"
+  # per-member extract with a live counter (A1.16). zf.extract() calls the
+  # same _extract_member as extractall/-m zipfile -e, so the tree is byte-
+  # identical; the archive is STORED (pack_pool.py), no symlinks/dir entries.
+  echo "extracting $(du -h "$POOL_ZIP" | cut -f1) (stored archive, ~30-60 s)"
+  python3 - "$POOL_ZIP" "$WORK/pool_extract" <<'PY' || die "unzip failed"
+import sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as zf:
+    infos = zf.infolist()
+    total = sum(zi.file_size for zi in infos) or 1
+    done = 0
+    for i, zi in enumerate(infos, 1):
+        zf.extract(zi, dst)
+        done += zi.file_size
+        sys.stderr.write(f"\r[{i}/{len(infos)}] "
+                         f"{done / 2**20:,.0f} / {total / 2**20:,.0f} MB")
+        sys.stderr.flush()
+    sys.stderr.write("\n")
+PY
   POOL="$WORK/pool_extract/pool"
   META=$(ls "$POOL"/coco_with_meta_*.csv 2>/dev/null | head -1)
   [ -n "$META" ] || die "no coco_with_meta_*.csv inside the pool archive"
@@ -197,7 +216,8 @@ bash "$REPO_DIR/setup_v2.sh" || die "setup_v2.sh failed"
 step "C. benchmark deps (torch protected — never let pip touch the cu128 wheel)"
 grep -viE '^(torch|torchvision|torchaudio)\b' benchmark/requirements-5090.txt \
   > /tmp/req_bm.txt || true
-pip install -q -r /tmp/req_bm.txt
+echo "installing benchmark deps (nnunetv2 tree is large; visible per-wheel; A1.16)"
+pip install --progress-bar on -r /tmp/req_bm.txt
 python3 - <<'PY' || exit 1
 import torch
 import segmentation_models_pytorch as smp

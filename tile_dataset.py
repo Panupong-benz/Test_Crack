@@ -197,7 +197,26 @@ class TiledCOCODataset(Dataset):
         self.tile_crack_pixels: List[int] = []
         union_cache: dict = {}
 
-        for img_id in sorted(self.images.keys()):
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:                    # off-box runs without tqdm
+            def _tqdm(it, **k):
+                return it
+        import sys as _sys
+        # Progress only on the stats path (per-annotation mask decode,
+        # "~1-3 min for 500 images" - the silent stretch of Amendment
+        # A1.16); the no-decode path is microseconds. disable is NOT
+        # tty-gated on purpose: under queue_runner stderr is a pipe, yet
+        # the parent re-renders the bar on a real terminal. RANK guard
+        # mirrors the trainer's is_main_process(). No numeric effect:
+        # tqdm is a pass-through iterator over the same sorted() order
+        # (check_tile_equivalence.py stays the proof).
+        _bar_off = ((not self._compute_tile_stats)
+                    or os.environ.get("RANK", "0") != "0")
+        for img_id in _tqdm(sorted(self.images.keys()),
+                            desc="Tile index", unit="img",
+                            mininterval=1.0, file=_sys.stderr,
+                            disable=_bar_off):
             info = self.images[img_id]
             w, h = info["width"], info["height"]
             origins = self._tile_origins(w, h)

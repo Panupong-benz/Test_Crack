@@ -174,7 +174,9 @@ def main():
         return 0
 
     md5 = []
-    for p, arc in files:
+    for _i, (p, arc) in enumerate(files, 1):
+        print(f"\r[md5 {_i}/{len(files)}] {arc[:70]:<70}", end="",
+              file=sys.stderr, flush=True)
         h = hashlib.md5()
         with open(p, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -194,9 +196,19 @@ def main():
     }
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(out, "w:gz") as tf:
-        for p, arc in files:
+    print(file=sys.stderr)
+    # compresslevel=1, not the default 9: the payload is mostly .pt/.png,
+    # already incompressible - identical tar contents, 3-5x faster gzip.
+    # Per-file counter (A1.16): this used to be the last silent stretch
+    # before poweroff.
+    _done = 0
+    with tarfile.open(out, "w:gz", compresslevel=1) as tf:
+        for _i, (p, arc) in enumerate(files, 1):
             tf.add(p, arcname=arc)
+            _done += p.stat().st_size
+            print(f"\r[tar {_i}/{len(files)}] {human(_done)} / {human(total)}   ",
+                  end="", file=sys.stderr, flush=True)
+        print(file=sys.stderr)
         for name, text in extras.items():
             data = text.encode("utf-8")
             info = tarfile.TarInfo(name)

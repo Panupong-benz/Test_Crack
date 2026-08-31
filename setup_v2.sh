@@ -34,7 +34,8 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 if ! python3 -c "import torch" >/dev/null 2>&1; then
   echo "torch is NOT in this image - installing the cu128 wheel (a few GB)."
   echo "Next time pick a PyTorch template with CUDA 12.8 (runbook SS2)."
-  pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
+  echo "downloading torch cu128 (~3 GB - pip shows a per-wheel bar; A1.16)"
+  pip install --progress-bar on torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
     || die "torch cu128 install failed - rent a PyTorch cu128 image instead"
 fi
 python3 - <<'PY' || exit 1
@@ -59,8 +60,10 @@ PY
 step "1. apt + python deps (torch protected)"
 apt-get update -qq && apt-get install -y -qq unzip >/dev/null 2>&1 || true
 grep -viE '^(torch|torchvision|torchaudio)\b' requirements.txt > /tmp/req_notorch.txt || true
-pip install -q -r /tmp/req_notorch.txt
-pip install -q bitsandbytes pycocotools tqdm pyyaml huggingface_hub gdown \
+echo "installing requirements.txt (torch-filtered; visible per-wheel; A1.16)"
+pip install --progress-bar on -r /tmp/req_notorch.txt
+echo "installing core deps (opencv/skimage/matplotlib/bitsandbytes, ~300-500 MB)"
+pip install --progress-bar on bitsandbytes pycocotools tqdm pyyaml huggingface_hub gdown \
     safetensors einops matplotlib scikit-image opencv-python-headless
 python3 - <<'PY' || exit 1
 import torch, bitsandbytes as bnb, skimage, matplotlib, cv2  # noqa
@@ -74,6 +77,23 @@ if [ -n "${HF_TOKEN:-}" ]; then
   huggingface-cli login --token "$HF_TOKEN" >/dev/null 2>&1 || \
   hf auth login --token "$HF_TOKEN" >/dev/null 2>&1 || true
   echo "HF login attempted (token from env only)"
+  # Pre-warm the SAM3 checkpoint HERE, visibly and cheaply (A1.16): the
+  # first queue job otherwise downloads 3.45 GB inside the paid queue, and
+  # a bad/pending token surfaces jobs-deep instead of now. WARN-and-
+  # continue on failure: the queue retries by itself, this is an early
+  # visible attempt, not a gate.
+  python3 - <<'PREWARM' || echo "WARN: SAM3 pre-warm failed (see above) - the first queue job will retry"
+from huggingface_hub import hf_hub_download
+print('pre-warming facebook/sam3 (config.json + sam3.pt, ~3.45 GB; tqdm bar below)')
+hf_hub_download('facebook/sam3', 'config.json')
+p = hf_hub_download('facebook/sam3', 'sam3.pt')
+print('sam3.pt cached at:', p)
+expected = ('/root/.cache/huggingface/hub/models--facebook--sam3/'
+            'snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt')
+if p != expected:
+    print('NOTE: path differs from configs/full_lora_config.yaml checkpoint_path;')
+    print('      the trainer will print a WARN and re-resolve via the HF cache (fast).')
+PREWARM
 else
   echo "WARN: HF_TOKEN not set - facebook/sam3 download will fail. export HF_TOKEN=hf_..."
 fi

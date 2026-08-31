@@ -183,6 +183,11 @@ def main():
                           f"{parts['cldice']:.4f},{args.lr},"
                           f"{time.time() - t0:.0f}\n")
                 log.flush()
+                # same cadence to the SCREEN (A1.16): each epoch was
+                # minutes of dead terminal between [epoch] lines
+                print(f"\r[{args.arch} s{args.seed}] ep {epoch} "
+                      f"step {step} loss {parts['total']:.3f} "
+                      f"({time.time() - t0:.0f}s)   ", end="", flush=True)
             if step % args.save_every == 0:
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                             "step": step, "epoch": epoch, "best": best}, last)
@@ -210,7 +215,8 @@ def main():
                 break
 
         score = validate(model, valid, device)
-        print(f"[epoch {epoch}] valid={score:.4f} best={best:.4f} step={step}")
+        print(f"\n[epoch {epoch}] valid={score:.4f} best={best:.4f} step={step}",
+              flush=True)
         vlog.write(f"{epoch},{step},{score:.6f},{max(best, score):.6f},"
                    f"{time.time() - t0:.0f}\n")
         vlog.flush()

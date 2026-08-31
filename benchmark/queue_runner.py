@@ -82,7 +82,11 @@ def main():
                                     stderr=subprocess.STDOUT)
             out = getattr(sys.stdout, "buffer", None)
             while True:
-                chunk = proc.stdout.read(4096)
+                # read1, not read: BufferedReader.read(n) BLOCKS until n bytes
+                # or EOF, so tqdm redraws (~150 B each) reached the screen only
+                # every ~25 redraws (measured 1.58 s vs 20 ms). read1 returns
+                # whatever is available after at most one raw read (A1.16).
+                chunk = proc.stdout.read1(4096)
                 if not chunk:
                     break
                 log.write(chunk)
