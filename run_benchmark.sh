@@ -12,6 +12,10 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 [ -f /workspace/.bm_env ] && source /workspace/.bm_env   # nnU-Net dirs + PYBIN/PATH (A1.13)
+# Instance count per tile varies 10x across the pool, so the allocator
+# sees wildly different block sizes and fragments. A1.19: 1.30 GB was
+# reserved-but-unallocated at the OOM. Caller can override.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Fail HERE, not at the kill-gate. The first queue job is a multi-hour
 # training run, so "No module named 'torch'" surfacing from inside it reads

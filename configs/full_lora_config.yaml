@@ -104,7 +104,12 @@ training:
   cldice:
     iters: 3                 # morphological thinning iterations
     max_size: 384            # downsample pred/target so max(H,W) <= this before skeletonise. <=0 disables.
-    use_checkpoint: false    # gradient checkpointing on pred skeletonise (slower, saves more memory)
+    use_checkpoint: true     # ON since A1.19: a dense tile matches ~400-500
+                             # instances and soft_skeletonize keeps every
+                             # intermediate at 384x384 for backward -> 29.2 GB
+                             # allocated, OOM at step 475/3001 on a 32 GB 5090.
+                             # Recompute in backward: identical math, ~1 extra
+                             # forward of a cheap pooling op.
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
