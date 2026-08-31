@@ -71,12 +71,16 @@ SPEC = [
     (REPO / "runs", "*/last_lora_weights.pt", False),
     (REPO / "runs", "*/masks/**/*", True),
     (REPO / "runs", "*.log", True),
-    # A1.21 item 110: the root must be REPO, not configs/benchmark - the
-    # arcname is p.relative_to(root.parent), so the old entry unpacked the
-    # A6 configs at benchmark/a6_*.yaml (colliding with the CODE namespace)
-    # and epoch_saturation --config-dir configs/benchmark found nothing,
-    # silently biasing every A6 row toward "saturated" via budget-or-n.
-    (REPO, "configs/benchmark/*.yaml", False),
+    # A1.21 item 110: the arcname is p.relative_to(root.parent), so the root
+    # must be REPO/configs (parent REPO) for the yaml to unpack at
+    # configs/benchmark/. The original root REPO/configs/benchmark unpacked
+    # it at benchmark/a6_*.yaml (colliding with the CODE namespace), and
+    # root=REPO would prefix the repo DIR NAME (Test_Crack/configs/...) -
+    # both leave epoch_saturation --config-dir configs/benchmark finding
+    # nothing, silently biasing every A6 row toward "saturated" via
+    # budget-or-n. The offline gate in the A1.21 round caught the second
+    # wrong form before it shipped.
+    (REPO / "configs", "benchmark/*.yaml", False),
     (REPO, "jobs.yaml", False),
     (REPO, "queue_state.json", True),
     (REPO, "QUEUE_DONE", False),
