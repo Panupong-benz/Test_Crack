@@ -155,8 +155,29 @@ real_steps = tiles_per_img*real/bs
 sec = real_steps*epochs/max(its,1e-6)
 print(f"[extrapolate] ~{tiles_per_img:.1f} tiles/img -> ~{real_steps:.0f} steps/epoch x {epochs} ep")
 print(f"[extrapolate] this fold (~{real} imgs): ~{sec/60:.0f} min  (~{sec/3600:.1f} h)  at {its} it/s")
-print(f"[extrapolate] both folds ~= roughly double (RW20T is larger).")
+# "roughly double" was written for the July 2-fold set and understates a
+# 4-fold LOWO run by ~2x - the number the operator reads before committing
+# to the rental. Scale by the train sizes actually on disk (A1.18).
+import glob
+tot = 0
+folds = []
+for j in sorted(glob.glob(os.path.join(os.path.dirname(src) or ".", "fold_*",
+                                       "train", "_annotations.coco.json"))):
+    n = len(json.load(open(j))["images"])
+    folds.append((os.path.basename(os.path.dirname(os.path.dirname(j))), n))
+    tot += n
+if tot:
+    all_h = sec / 3600 * tot / max(real, 1)
+    print("[extrapolate] folds on disk: "
+          + ", ".join(f"{k}={n}" for k, n in folds))
+    print(f"[extrapolate] ALL {len(folds)} folds (train imgs {tot}): "
+          f"~{all_h:.1f} h of a6 training  (+ a5/predict/eval ~1-2 h)")
+else:
+    print("[extrapolate] WARNING: no sibling fold_*/ found - cannot total the run")
 PY
 fi
 say "==============================================="
-say "if this looks good: ./run_train.sh RW20"
+say "if this looks good (A1.8 interim):"
+say "  source /workspace/.bm_env"
+say "  python3 benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
+say "  bash run_benchmark.sh full"

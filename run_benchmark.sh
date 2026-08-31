@@ -37,6 +37,15 @@ start_monitor() {
   sleep 1
   if kill -0 "$pid" 2>/dev/null; then
     echo "resource monitor started (pid $pid)"
+    return
+  fi
+  # The launcher also exits 0 when a daemon is ALREADY running (pidfile
+  # guard), so a dead $pid is not proof of failure - it is the benign case
+  # after smoke-a6. Distinguish them before crying wolf (Amendment A1.18).
+  local old_pid=""
+  [ -f results/benchmark/resource_monitor.pid ] &&       old_pid="$(cat results/benchmark/resource_monitor.pid 2>/dev/null)"
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    echo "resource monitor already running (pid $old_pid) - reusing it"
   else
     echo "WARN: resource monitor did NOT start - see runs/resource_monitor.log"
     tail -n 3 runs/resource_monitor.log 2>/dev/null

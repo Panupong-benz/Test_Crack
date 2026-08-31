@@ -41,6 +41,14 @@ def main():
     state_f = Path("queue_state.json")
     state = json.loads(state_f.read_text()) if state_f.exists() else {}
     Path("runs").mkdir(exist_ok=True)
+    # A QUEUE_DONE left by a PREVIOUS queue (the smoke, typically) makes the
+    # resource monitor exit two ticks into THIS one, so the full run samples
+    # nothing (Amendment A1.18). The marker means "the queue that just ran
+    # finished"; a queue starting invalidates it. Removed here, rewritten below.
+    try:
+        Path("QUEUE_DONE").unlink()
+    except OSError:
+        pass
 
     for job in jobs:
         name = job["name"]
