@@ -255,8 +255,13 @@ cat > "$WORK/.bm_env" <<ENV
 export nnUNet_raw="$nnUNet_raw"
 export nnUNet_preprocessed="$nnUNet_preprocessed"
 export nnUNet_results="$nnUNet_results"
-# interpreter pinned at setup time (A1.13); PATH first so both `python3`
-# and any `python` shim in the same dir resolve to the torch-bearing one
+# interpreter pinned at setup time (A1.13); PATH first so both python3
+# and any python shim in the same dir resolve to the torch-bearing one.
+# NO BACKTICKS IN THIS HEREDOC: it is unquoted (<<ENV) so that \$PYBIN and
+# \$PYDIR expand, which means bash also runs backticks as command
+# substitution - the two decorative backtick pairs that used to sit here
+# literally launched 'python3' and 'python' as interactive REPLs and hung
+# setup at step E until someone pressed Ctrl-D (A1.17).
 export BM_PYBIN="$PYBIN"
 export PATH="$PYDIR:$PATH"
 ENV
