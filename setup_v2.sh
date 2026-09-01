@@ -61,7 +61,14 @@ step "1. apt + python deps (torch protected)"
 apt-get update -qq && apt-get install -y -qq unzip >/dev/null 2>&1 || true
 grep -viE '^(torch|torchvision|torchaudio)\b' requirements.txt > /tmp/req_notorch.txt || true
 echo "installing requirements.txt (torch-filtered; visible per-wheel; A1.16)"
-pip install --progress-bar on -r /tmp/req_notorch.txt
+# A1.24 item 137: this is the ONLY route by which decord / iopath /
+# torchmetrics / transformers / scipy reach the box, and the sam3 import
+# chain needs all of them. It used to run unchecked under `set -uo pipefail`
+# (no -e), so a failure here printed green through steps B-F and surfaced
+# hours later, inside a paid job, as a ModuleNotFoundError that reads like a
+# code bug. Step F now also imports sam3 for real.
+pip install --progress-bar on -r /tmp/req_notorch.txt \
+  || die "requirements.txt install FAILED - decord/iopath/torchmetrics reach the box ONLY through this file and the sam3 import chain needs them. ENVIRONMENT fault, not a code bug: read the pip error above."
 echo "installing core deps (opencv/skimage/matplotlib/bitsandbytes, ~300-500 MB)"
 pip install --progress-bar on bitsandbytes pycocotools tqdm pyyaml huggingface_hub gdown \
     safetensors einops matplotlib scikit-image opencv-python-headless

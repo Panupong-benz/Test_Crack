@@ -117,6 +117,7 @@ class SAM3LoRAInference:
         pp_close_kernel: int = 20,
         pp_open_kernel: int = 3,
         use_skeleton: bool = False,
+        no_lora: bool = False,
         device: str = "cuda"
     ):
         """
@@ -149,14 +150,26 @@ class SAM3LoRAInference:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
-        # Auto-detect weights if not provided
-        if weights_path is None:
-            output_dir = self.config.get('output', {}).get('output_dir', 'outputs/sam3_lora_full')
-            weights_path = os.path.join(output_dir, 'best_lora_weights.pt')
-            print(f"ℹ️  Auto-detected weights: {weights_path}")
+        # A1.24 item 134: base-model (zero-shot) mode. Additive and OFF by
+        # default - with no_lora=False every line below runs exactly as it
+        # did before, so the RW20 vision tier is untouched.
+        self.no_lora = no_lora
+        if no_lora:
+            if weights_path is not None:
+                raise ValueError(
+                    "no_lora and weights_path are mutually exclusive: one "
+                    "asks for the BASE model, the other for a fine-tuned one")
+            print("ℹ️  no-lora: BASE SAM3 - LoRA is not applied and "
+                  "no weights are loaded")
+        else:
+            # Auto-detect weights if not provided
+            if weights_path is None:
+                output_dir = self.config.get('output', {}).get('output_dir', 'outputs/sam3_lora_full')
+                weights_path = os.path.join(output_dir, 'best_lora_weights.pt')
+                print(f"ℹ️  Auto-detected weights: {weights_path}")
 
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"LoRA weights not found: {weights_path}")
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(f"LoRA weights not found: {weights_path}")
 
         self.weights_path = weights_path
         self.resolution = resolution
@@ -195,25 +208,28 @@ class SAM3LoRAInference:
         )
 
         # Apply LoRA configuration
-        print("🔗 Applying LoRA configuration...")
-        lora_cfg = self.config["lora"]
-        lora_config = LoRAConfig(
-            rank=lora_cfg["rank"],
-            alpha=lora_cfg["alpha"],
-            dropout=0.0,  # No dropout during inference
-            target_modules=lora_cfg["target_modules"],
-            apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
-            apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
-            apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
-            apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
-            apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
-            apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
-        )
-        self.model = apply_lora_to_model(self.model, lora_config)
+        if no_lora:
+            print("⏭️  Skipping LoRA - base SAM3 as published")
+        else:
+            print("🔗 Applying LoRA configuration...")
+            lora_cfg = self.config["lora"]
+            lora_config = LoRAConfig(
+                rank=lora_cfg["rank"],
+                alpha=lora_cfg["alpha"],
+                dropout=0.0,  # No dropout during inference
+                target_modules=lora_cfg["target_modules"],
+                apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
+                apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
+                apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
+                apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
+                apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
+                apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
+            )
+            self.model = apply_lora_to_model(self.model, lora_config)
 
-        # Load LoRA weights
-        print(f"💾 Loading LoRA weights from {weights_path}...")
-        load_lora_weights(self.model, weights_path)
+            # Load LoRA weights
+            print(f"💾 Loading LoRA weights from {weights_path}...")
+            load_lora_weights(self.model, weights_path)
 
         self.model.to(self.device)
         self.model.eval()
@@ -237,7 +253,8 @@ class SAM3LoRAInference:
         # because PostProcessImage may have additional filtering logic
         self.use_manual_postprocess = True
 
-        print("✅ SAM3 + LoRA ready for inference!\n")
+        print(f"✅ SAM3 {'(base, no LoRA)' if no_lora else '+ LoRA'} "
+              f"ready for inference!\n")
 
     # ------------------------------------------------------------------
     # Preprocessing helpers (thesis report §4.2 / §6)
@@ -1088,6 +1105,13 @@ def main():
         help="Path to LoRA weights (auto-detected if not provided)"
     )
     parser.add_argument(
+        "--no-lora", action="store_true",
+        help="Base SAM3 as published: do not apply LoRA and do not load any "
+             "weights (benchmark row A5). Mutually exclusive with --weights; "
+             "WITHOUT it, an omitted --weights AUTO-DETECTS a checkpoint "
+             "(A1.24 item 132.3)."
+    )
+    parser.add_argument(
         "--image",
         type=str,
         required=True,
@@ -1302,6 +1326,7 @@ def main():
         pp_close_kernel=args.pp_close,
         pp_open_kernel=args.pp_open,
         use_skeleton=args.skeletonize,
+        no_lora=args.no_lora,
     )
 
     # Route to one of: TTA, sliding-window, or single-pass inference.

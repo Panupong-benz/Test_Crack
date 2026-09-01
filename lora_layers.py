@@ -528,14 +528,39 @@ def save_lora_weights(model: nn.Module, save_path: str):
     print(f"Saved LoRA weights to {save_path}")
 
 
-def load_lora_weights(model: nn.Module, load_path: str):
+def load_lora_weights(model: nn.Module, load_path: str,
+                      strict_lora: bool = True):
     """
     Load LoRA weights into a model.
 
     Args:
         model: Model with LoRA layers
         load_path: Path to LoRA weights
+        strict_lora: raise if the checkpoint matched NOTHING in the model
+            (Amendment A1.24 item 135). This call used to be
+            `load_state_dict(..., strict=False)` with the return value
+            thrown away, so a key-name mismatch loaded zero tensors in
+            silence and inference then ran the BASE network while its
+            output was labelled as the fine-tuned row - a corrupted result
+            with no error anywhere. Pass False only if a partial load is
+            genuinely wanted and the counts have been checked by the caller.
+
+    Returns:
+        (n_matched, unexpected_keys)
     """
     lora_state_dict = torch.load(load_path)
-    model.load_state_dict(lora_state_dict, strict=False)
-    print(f"Loaded LoRA weights from {load_path}")
+    _, unexpected = model.load_state_dict(lora_state_dict, strict=False)
+    n_ckpt = len(lora_state_dict)
+    n_matched = n_ckpt - len(unexpected)
+    print(f"Loaded LoRA weights from {load_path} "
+          f"({n_matched}/{n_ckpt} tensors matched the model)")
+    if strict_lora and n_matched == 0:
+        raise RuntimeError(
+            f"LoRA checkpoint {load_path} matched NOTHING in this model "
+            f"({n_ckpt} tensors, all unexpected) - the model would have run "
+            f"as the plain base network. First unexpected keys: "
+            f"{list(unexpected)[:5]}")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} checkpoint tensors did not "
+              f"match, e.g. {list(unexpected)[:3]}")
+    return n_matched, list(unexpected)

@@ -195,7 +195,9 @@ if [ -f "$WORK/pool_extract/folds_summary_expected.json" ]; then
       --got "$WORK/folds/folds_summary.json" \
       || die "fold gate FAILED - the pool did not reproduce the frozen split"
 else
-  echo "fold gate: SKIPPED - folds already on disk; re-extract the pool to gate them"
+  echo "fold gate: SKIPPED - no $WORK/pool_extract/folds_summary_expected.json"
+  echo "  (the folds on disk were NOT checked against the frozen split;"
+  echo "   re-extract pool_BM.zip to gate them)"
 fi
 # image frame vs COCO record: PIL ignores EXIF orientation while Roboflow
 # applied it, so a flagged photo would train/predict on the wrong axis
@@ -282,11 +284,32 @@ python3 benchmark/check_images.py --selftest || die "check_images selftest FAILE
 # the trainer having NO LR scheduler - a shorter run must be a prefix of a
 # longer one. Milliseconds, no torch.
 python3 benchmark/check_prefix_property.py || die "prefix-property guard FAILED"
+# A1.24 item 137: NO gate anywhere used to import sam3, yet every training and
+# every inference job does. A break in that chain therefore surfaced inside a
+# paid job as a bare ModuleNotFoundError. ~5 s (it pulls torch).
+( cd "$REPO_DIR" && python3 - <<'PY'
+import importlib
+mods = ["decord", "iopath", "torchmetrics", "scipy",
+        "sam3.model_builder", "sam3.train.loss.loss_fns",
+        "sam3.train.data.sam3_image_dataset", "sam3.train.data.collator"]
+for m in mods:
+    importlib.import_module(m)
+print("sam3 import chain OK (%d modules)" % len(mods))
+PY
+) || die "sam3 import chain FAILED - the trainer and infer_sam cannot start.
+This is an ENVIRONMENT fault, NOT a code bug: the module named above is
+missing, most likely because the requirements.txt install in step B did not
+complete. Re-run setup_v2.sh and read its pip output."
+# A1.24 item 135: load_lora_weights used to discard the strict=False result,
+# so a key-name mismatch loaded NOTHING in silence and row A6 became row A5.
+python3 benchmark/check_lora_load.py || die "LoRA-load guard FAILED"
 
 echo -e "\nsetup_benchmark complete. Next - INTERIM SCOPE (A6 seed 0 + A5, Amendment A1.8):"
-echo "  1. bash run_benchmark.sh smoke-a6     # ~15 min: pipe + s/step for the hour estimate"
+echo "  1. bash run_benchmark.sh smoke-a6     # ~25 min: pipe, resume, INFER path, s/step"
+echo "     smoke_lora_effect MUST PASS - it proves the LoRA weights reach the model (A1.24)"
 echo "  2. source /workspace/.bm_env   # PATH + interpreter (needed in any NEW shell/tab)"
-echo "  3. python3 benchmark/make_jobs.py --rows a6 a5 --seeds 0 --batch 8 --out jobs.yaml"
+echo "  3. python3 benchmark/make_jobs.py --rows a6 a5 --seeds 0 \\"
+echo "         --folds RW20 RW20C --batch 8 --out jobs.yaml   # 20 jobs; --folds is NOT optional"
 echo "  4. bash run_benchmark.sh full  # inside tmux; job progress streams to this screen"
 echo ""
 echo "  (the full six-row grid is SHELVED pending the advisor - Q18.4. To run it:"

@@ -8,12 +8,26 @@ prompt / sliding-window / threshold path, minus the LoRA weights.
 
 Usage:
   python run_a5_zeroshot.py --fold <fold_dir> --out <masks_dir> \
-      [--prompt crack] [--threshold 0.3] [--extra "--tta ..."]
-Exact flag semantics (incl. how infer_sam behaves with no --weights) are
-confirmed at smoke hour; if base-model loading needs a flag change, amend
-HERE only — every row must keep flowing through infer_sam.
+      [--config configs/full_lora_config.yaml] [--weights <lora.pt>] \
+      [--prompt crack] [--threshold 0.3] [--limit N] [--extra "--tta ..."]
+  python run_a5_zeroshot.py --selftest      # command assembly, no GPU
 
-Two things this shim must never get wrong again (Amendment A1.4):
+THE MODES ARE NOT SYMMETRIC (Amendment A1.24 item 133):
+  --weights <path>  -> row A6: LoRA applied, that checkpoint loaded
+  no --weights      -> row A5: --no-lora is passed to infer_sam, which then
+                       applies no LoRA and loads NOTHING. Never leave this to
+                       infer_sam's own default: without --no-lora it
+                       AUTO-DETECTS outputs/sam3_lora_full/best_lora_weights.pt
+                       - the file the smoke hour writes - so "zero-shot" would
+                       silently have been a 1-2 epoch smoke checkpoint.
+
+Three things this shim must never get wrong again (Amendments A1.4, A1.24):
+  * --config is REQUIRED by infer_sam (required=True). It was never passed,
+    so every infer job would have died on argparse - first at job 3 of the
+    queue, i.e. after ~22 h of paid training. The default below is the base
+    config; make_jobs/a6_adaptive override only data_dir/seed/output_dir/
+    num_epochs, so its `lora:` section (rank 16, 12 target modules) matches
+    every A6 checkpoint by construction.
   * --save-mask is ALWAYS passed. Without it infer_sam writes only the
     matplotlib overlay figure, which eval_masks would then score as if it
     were the prediction — silent garbage on the most expensive rows.
@@ -40,41 +54,74 @@ for INFER in (_ROOT / "code" / "infer_sam.py", _ROOT / "infer_sam.py"):
 else:
     raise FileNotFoundError(f"infer_sam.py not found under {_ROOT}")
 EXTS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+DEFAULT_CONFIG = _ROOT / "configs" / "full_lora_config.yaml"
+
+
+def build_cmd(img: Path, args) -> list:
+    """The exact argv handed to infer_sam. Extracted so the selftest can
+    check it with no model, no GPU and no images (A1.24 item 139)."""
+    cmd = [sys.executable, str(INFER),
+           "--config", str(args.config),
+           "--image", str(img),
+           "--prompt", args.prompt,
+           "--output", str(args.out / img.stem),
+           "--threshold", str(args.threshold),
+           "--sliding-window",
+           "--tile-size", str(args.tile_size),
+           "--tile-overlap", str(args.tile_overlap),
+           "--save-mask",
+           "--no-progress"]
+    if args.weights is not None:
+        cmd += ["--weights", str(args.weights)]
+    else:
+        # row A5. NOT infer_sam's default - see the module docstring.
+        cmd += ["--no-lora"]
+    cmd += args.extra.split()
+    return cmd
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fold", type=Path, required=True)
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--fold", type=Path)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                    help="training config infer_sam builds the model from "
+                         "(REQUIRED by infer_sam; default = the base config)")
     ap.add_argument("--prompt", default="crack")
     ap.add_argument("--threshold", type=float, default=0.3)
     ap.add_argument("--tile-size", type=int, default=1008)
     ap.add_argument("--tile-overlap", type=float, default=0.25)
     ap.add_argument("--weights", type=Path, default=None,
                     help="LoRA weights -> row A6 inference; omit for A5 "
-                         "zero-shot (same shim, one production path)")
+                         "zero-shot, which passes --no-lora (same shim, one "
+                         "production path)")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="only the first N test images (smoke probe)")
     ap.add_argument("--extra", default="", help="extra infer_sam flags")
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+    for req in ("fold", "out"):
+        if getattr(args, req) is None:
+            ap.error(f"--{req} is required")
+    if not args.config.exists():
+        raise SystemExit(f"FATAL: --config {args.config} not found. "
+                         f"infer_sam requires it (A1.24 item 132.1).")
+    mode = "a6_lora" if args.weights is not None else "a5_zeroshot"
+    print(f"[run_a5_zeroshot] mode={mode}  config={args.config}"
+          + (f"  weights={args.weights}" if args.weights else "  (--no-lora)"),
+          flush=True)
 
     test_dir = args.fold / "test"
     imgs = sorted(p for p in test_dir.iterdir() if p.suffix in EXTS)
+    if args.limit:
+        imgs = imgs[:args.limit]
     args.out.mkdir(parents=True, exist_ok=True)
     failures, secs = [], []
     t_all = time.time()
     for i, img in enumerate(imgs):
-        cmd = [sys.executable, str(INFER),
-               "--image", str(img),
-               "--prompt", args.prompt,
-               "--output", str(args.out / img.stem),
-               "--threshold", str(args.threshold),
-               "--sliding-window",
-               "--tile-size", str(args.tile_size),
-               "--tile-overlap", str(args.tile_overlap),
-               "--save-mask",
-               "--no-progress"]
-        if args.weights is not None:
-            cmd += ["--weights", str(args.weights)]
-        cmd += args.extra.split()
+        cmd = build_cmd(img, args)
         t0 = time.time()
         r = subprocess.run(cmd, capture_output=True, text=True)
         dt = time.time() - t0
@@ -97,6 +144,8 @@ def main():
     # (predict_seg records ms_per_tile for A2-A4; infer_sam records nothing)
     (args.out / "a5_run.json").write_text(json.dumps(
         {"n": len(imgs), "failures": failures,
+         "mode": mode, "config": str(args.config),
+         "weights": None if args.weights is None else str(args.weights),
          "threshold": args.threshold,
          "fusion": "or_union+morphology (production infer_sam)",
          "sec_total": round(time.time() - t_all, 1),
@@ -108,5 +157,41 @@ def main():
         sys.exit(1)
 
 
+def selftest() -> int:
+    """Command assembly only - the part that was wrong and that no GPU is
+    needed to check."""
+    import types
+    base = dict(config=Path("configs/full_lora_config.yaml"), prompt="crack",
+                out=Path("out"), threshold=0.3, tile_size=1008,
+                tile_overlap=0.25, extra="", weights=None)
+    img = Path("IMG_1.jpg")
+
+    a5 = build_cmd(img, types.SimpleNamespace(**base))
+    a6 = build_cmd(img, types.SimpleNamespace(**{**base,
+                                                "weights": Path("best.pt")}))
+
+    for name, cmd in (("A5", a5), ("A6", a6)):
+        assert "--config" in cmd, f"{name}: infer_sam requires --config"
+        assert cmd[cmd.index("--config") + 1].endswith("full_lora_config.yaml")
+        # A1.4: without --save-mask infer_sam writes only its overlay figure
+        assert "--save-mask" in cmd, f"{name}: --save-mask missing"
+        assert "--no-progress" in cmd and "--sliding-window" in cmd
+        assert cmd[cmd.index("--threshold") + 1] == "0.3"
+
+    assert "--no-lora" in a5 and "--weights" not in a5, a5
+    assert "--weights" in a6 and "--no-lora" not in a6, a6
+    assert a6[a6.index("--weights") + 1] == "best.pt"
+
+    extra = build_cmd(img, types.SimpleNamespace(**{**base,
+                                                   "extra": "--tta --seed 1"}))
+    assert extra[-3:] == ["--tta", "--seed", "1"], extra[-3:]
+
+    print("run_a5_zeroshot selftest PASS: --config always passed; A5 asks for "
+          "--no-lora and never --weights (so infer_sam cannot auto-detect the "
+          "smoke checkpoint); A6 passes --weights and never --no-lora; "
+          "--save-mask kept on both")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

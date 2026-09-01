@@ -19,3 +19,29 @@ jobs:
   - name: smoke_resume
     after: smoke_sam3
     cmd: python3 benchmark/smoke_resume.py
+  # A1.24: the A5/A6 inference path had NEVER been executed - infer_sam
+  # requires --config and the shim never passed it, so job 3 of the real
+  # queue (non-optional, right after ~22 h of pilot training) would have
+  # died on argparse. These four jobs run that whole path on 2 smoke images
+  # in ~3-5 min, before any money is committed.
+  - name: smoke_infer_a6
+    after: smoke_resume
+    cmd: python3 benchmark/run_a5_zeroshot.py --fold /workspace/smoke/smoke_fold
+      --out /workspace/smoke/m_a6 --limit 2
+      --weights outputs/sam3_lora_full/best_lora_weights.pt
+  - name: smoke_infer_a5
+    after: smoke_infer_a6
+    cmd: python3 benchmark/run_a5_zeroshot.py --fold /workspace/smoke/smoke_fold
+      --out /workspace/smoke/m_a5 --limit 2
+  # infer -> _mask.png -> eval, end to end. Written OUTSIDE results/benchmark
+  # so summarize's eval_* glob never sees it (the A1.6 item 48 trap).
+  - name: smoke_eval_real
+    after: smoke_infer_a5
+    cmd: python3 benchmark/eval_masks.py --gt /workspace/smoke/smoke_fold/test
+      --pred /workspace/smoke/m_a6 --out /workspace/smoke/eval_probe.csv
+  # the one check that catches BOTH silent failures: if the LoRA weights did
+  # not reach the model, A6 and A5 masks come out identical. MUST PASS.
+  - name: smoke_lora_effect
+    after: smoke_eval_real
+    cmd: python3 benchmark/check_lora_effect.py --a6 /workspace/smoke/m_a6
+      --a5 /workspace/smoke/m_a5
