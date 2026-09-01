@@ -35,10 +35,24 @@ SEG_ARCHS = ["unet", "deeplabv3p", "segformer"]
 ALL_ROWS = ["a1", "unet", "deeplabv3p", "segformer", "a5", "a6"]
 
 
-def override_keys(cfg: dict, data_dir: str, seed: int, out_dir: str) -> dict:
+def override_keys(cfg: dict, data_dir: str, seed: int, out_dir: str,
+                  gpus: int = 1) -> dict:
     """Recursively set data_dir / seed / output_dir wherever they occur —
-    tolerant of the config's section layout (the base YAML nests them)."""
+    tolerant of the config's section layout (the base YAML nests them).
+
+    gpus > 1 (A1.27 item 150): divide gradient_accumulation_steps by gpus so
+    the EFFECTIVE batch (micro x accum x ranks) and the optimizer steps per
+    epoch stay exactly what the single-GPU run had. Refuses a non-integer
+    split rather than silently changing the experiment."""
     cfg = copy.deepcopy(cfg)
+    if gpus > 1:
+        tr = cfg.setdefault("training", {})
+        acc = int(tr.get("gradient_accumulation_steps", 1))
+        if acc % gpus:
+            raise SystemExit(f"gradient_accumulation_steps={acc} is not divisible "
+                             f"by --gpus {gpus}: the effective batch could not be "
+                             f"kept - pick a divisor or change the base config")
+        tr["gradient_accumulation_steps"] = acc // gpus
 
     def walk(node):
         if isinstance(node, dict):
@@ -88,6 +102,11 @@ def main():
     ap.add_argument("--marked-list", default="marked_line_images.txt")
     ap.add_argument("--results", default="results/benchmark")
     ap.add_argument("--nnunet-id-base", type=int, default=501)
+    ap.add_argument("--gpus", type=int, default=1,
+                    help="GPUs per A6 training (A1.27). 1 = byte-identical "
+                         "queue; N>1 adds --device 0..N-1 (the trainer self-"
+                         "launches torchrun) and divides grad accumulation by N "
+                         "so the effective batch stays 16.")
     ap.add_argument("--rows", nargs="+", default=ALL_ROWS,
                     choices=ALL_ROWS, metavar="ROW",
                     help="which benchmark rows to emit (default: all six). "
@@ -155,7 +174,12 @@ def main():
     _adaptive_common = (f"--results {args.results} "
                         f"--config-dir {args.config_dir.as_posix()} "
                         f"--base-config {args.base_config.as_posix()} "
-                        f"--data-root {args.data_root}")
+                        f"--data-root {args.data_root}"
+                        + (f" --gpus {args.gpus}" if args.gpus > 1 else ""))
+    # --device 0..N-1 only when N>1: a single-GPU queue must stay byte-
+    # identical to every queue generated before A1.27.
+    _dev = (" --device " + " ".join(str(i) for i in range(args.gpus))
+            if args.gpus > 1 else "")
 
     def a6_jobs(fold, seed, after, gate=False, adaptive=False):
         """gate=True keeps the whole chain non-optional and returns the EVAL
@@ -174,7 +198,7 @@ def main():
                     after=after)
         else:
             cfg = override_keys(base_cfg, f"{args.data_root}/fold_{fold}",
-                                seed, f"runs/{tag}")
+                                seed, f"runs/{tag}", gpus=args.gpus)
             if args.a6_epochs:
                 # set AFTER override_keys - its key-name walk would clobber
                 # every num_epochs in the tree (A1.21 item 114)
@@ -187,7 +211,8 @@ def main():
             # after a kill continues from the last completed epoch instead of
             # epoch 0 (the A1.21 item 107 risk, closed).
             t = add(tag, f"python3 train_sam3_lora_native_claude.py "
-                         f"--config {cfg_path.as_posix()} --resume", after=after)
+                         f"--config {cfg_path.as_posix()} --resume{_dev}",
+                    after=after)
         # weight filename confirmed at smoke hour; find keeps it layout-proof
         i = add(f"infer_{tag}",
                 f"python3 benchmark/run_a5_zeroshot.py "

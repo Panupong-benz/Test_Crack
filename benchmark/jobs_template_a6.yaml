@@ -3,6 +3,10 @@
 # is no batch sweep: the smoke's whole job is to prove the pipe and print the
 # s/step that the runbook's hour formula consumes before the queue is released.
 #   bash run_benchmark.sh smoke-a6
+#   BM_GPUS=2 bash run_benchmark.sh smoke-a6     # A1.27: smoke_test.sh and
+#       smoke_resume.py read BM_DEVICES ("0 1") and hand the trainer
+#       --device 0 1, so the pipe is proven at the world size the queue
+#       will use (make_jobs --gpus 2 bakes the same flag into jobs.yaml).
 # The full 4a ladder (jobs_template.yaml) stays for the shelved baseline grid.
 jobs:
   - name: smoke_eval_unit

@@ -234,13 +234,18 @@ def budget_row(run: Path, model: str, cfg_dir: Path, hours):
         # divide by grad_accum or A6's ~12,200 optimizer steps would be
         # reported as ~97,600. A2-A4 run.json has no grad_accum key -> 1.
         acc = int(j.get("grad_accum", 1) or 1)
+        # A1.27 item 152(b): under DDP each rank walks tiles/world micro-
+        # steps, so the optimizer-step count divides by world_size too.
+        # Missing key = 1 (every single-GPU run.json ever written).
+        world = int(j.get("world_size", 1) or 1)
         rf = j.get("resumed_from") or ""
         row.update(epochs=ep or "", batch=bs or "", grad_accum=acc,
+                   world_size=world,
                    n_train_tiles=tiles or "", budget_source="run.json",
                    resumed_from=("/".join(str(x) for x in rf)
                                  if isinstance(rf, list) else rf))
         if ep and bs and tiles:
-            row["optimizer_steps"] = (tiles // bs) * ep // acc
+            row["optimizer_steps"] = (tiles // (bs * world)) * ep // acc
             row["samples_seen"] = tiles * ep
         return row
     cfg = cfg_dir / f"{run.name}.yaml"                 # A6
@@ -343,7 +348,8 @@ def collect(runs_dir: Path, results: Path, cfg_dir: Path,
     with open(results / "budget_table.csv", "w", newline="",
               encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=["run", "model", "epochs", "batch",
-                                           "grad_accum", "n_train_tiles",
+                                           "grad_accum", "world_size",
+                                           "n_train_tiles",
                                            "optimizer_steps", "samples_seen",
                                            "hours", "budget_source",
                                            "resumed_from"])
@@ -475,6 +481,22 @@ def selftest():
         assert int(b1["optimizer_steps"]) == (6000 // 2) * 30 // 8, (
             "grad_accum must divide micro-steps", b1)
         assert b1["budget_source"] == "run.json", b1
+        # A1.27: the 2-GPU twin (accum 8/2, world 2) has the SAME optimizer
+        # steps - the bug this closes reported it 2x too high.
+        d3 = runs / "a6_F3_s0"
+        d3.mkdir(parents=True)
+        (d3 / "run.json").write_text(json.dumps(
+            {"epochs": 30, "batch": 2, "grad_accum": 4, "world_size": 2,
+             "n_train_tiles": 6000}))
+        write_stats(d3, [real])
+        rows3 = collect(runs, res, root / "cfg", root / "queue_state.json",
+                        None)
+        bt3 = list(csv.DictReader(open(res / "budget_table.csv",
+                                       encoding="utf-8")))
+        b3 = next(b for b in bt3 if b["run"] == "a6_F3_s0")
+        assert int(b3["optimizer_steps"]) == int(b1["optimizer_steps"]), (
+            "2-GPU accum 4 must equal 1-GPU accum 8 in optimizer steps", b3, b1)
+        assert int(b3["world_size"]) == 2, b3
     # A1.22: an extended run appends epochs 31..60 to the same file - that is
     # a CONTINUATION (one block, restarts=0), not a restart, and the budget
     # comes from the rewritten run.json (epochs=60, resumed_from=[30])

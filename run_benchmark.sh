@@ -16,6 +16,12 @@ cd "$(dirname "$0")"
 # sees wildly different block sizes and fragments. A1.19: 1.30 GB was
 # reserved-but-unallocated at the OOM. Caller can override.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# A1.27: BM_GPUS=N -> BM_DEVICES="0 .. N-1" for the smoke scripts (smoke_test.sh,
+# smoke_resume.py read it). The real queue bakes --device in via make_jobs
+# --gpus, so this only shapes the smoke. Default 1 = every previous rental.
+BM_GPUS="${BM_GPUS:-1}"
+export BM_DEVICES="${BM_DEVICES:-$(seq -s " " 0 $((BM_GPUS - 1)))}"
+echo "GPUs for smoke: ${BM_DEVICES}  (BM_GPUS=${BM_GPUS})"
 
 # Fail HERE, not at the kill-gate. The first queue job is a multi-hour
 # training run, so "No module named 'torch'" surfacing from inside it reads

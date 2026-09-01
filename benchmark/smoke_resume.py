@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -49,7 +50,13 @@ def main() -> int:
     ap.add_argument("--trainer", default="train_sam3_lora_native_claude.py")
     ap.add_argument("--val-tol", type=float, default=0.10,
                     help="loose relative tolerance on epoch-2 val_loss (cudnn)")
+    ap.add_argument("--devices", default=os.environ.get("BM_DEVICES", "0"),
+                    help="A1.27: GPU ids, e.g. '0 1' - both runs get the same "
+                         "--device so resume is proven under the SAME world size "
+                         "the queue will use (default: env BM_DEVICES or 0)")
     a = ap.parse_args()
+    dev = ["--device"] + a.devices.split()
+    print(f"[smoke_resume] devices {a.devices} ({len(dev) - 1} GPU)", flush=True)
 
     base = yaml.safe_load(Path(a.smoke_config).read_text(encoding="utf-8"))
     out_dir = Path(base["output"]["output_dir"])
@@ -67,7 +74,8 @@ def main() -> int:
     cfg_r["training"]["num_epochs"] = 2
     p_r = Path(a.smoke_config).with_name("smoke_config_e2.yaml")
     p_r.write_text(yaml.safe_dump(cfg_r, sort_keys=False), encoding="utf-8")
-    _run([sys.executable, a.trainer, "--config", str(p_r), "--resume"], "resume 1->2")
+    _run([sys.executable, a.trainer, "--config", str(p_r), "--resume"] + dev,
+         "resume 1->2")
 
     recs = _records(out_dir / "val_stats.json")
     ep = [r["epoch"] for r in recs]
@@ -86,7 +94,7 @@ def main() -> int:
     cfg_s["output"]["output_dir"] = str(out_dir.with_name(out_dir.name + "_straight2"))
     p_s = Path(a.smoke_config).with_name("smoke_config_straight2.yaml")
     p_s.write_text(yaml.safe_dump(cfg_s, sort_keys=False), encoding="utf-8")
-    _run([sys.executable, a.trainer, "--config", str(p_s)], "straight 2 epochs")
+    _run([sys.executable, a.trainer, "--config", str(p_s)] + dev, "straight 2 epochs")
     recs_s = _records(Path(cfg_s["output"]["output_dir"]) / "val_stats.json")
     if [r["epoch"] for r in recs_s] != [1, 2]:
         raise SystemExit(f"[smoke_resume] straight run wrote {recs_s}")

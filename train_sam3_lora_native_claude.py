@@ -928,7 +928,13 @@ class SAM3TrainerNative:
                 self.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=False  # Frozen params (requires_grad=False) don't need this flag
+                # A1.27 item 152(a): False is right ONLY if every TRAINABLE
+                # (LoRA) parameter takes part in every backward. Frozen params
+                # are irrelevant to this flag. If the 2-GPU smoke dies with
+                # "Expected to have finished reduction in the prior iteration"
+                # some LoRA target (geometry encoder under text-only prompts?)
+                # is unused -> set True (~5-10% slower) and re-smoke.
+                find_unused_parameters=False
             )
             print_rank0(f"Model wrapped with DistributedDataParallel")
 
@@ -1276,7 +1282,7 @@ class SAM3TrainerNative:
                 _old = {}
             restarts = int(_old.get("restarts", 0) or 0)
             _resumed_from = list(_old.get("resumed_from", []) or []) + [start_epoch]
-            self._rng_to_restore = st["rng"]
+            self._rng_to_restore = st          # whole state: rng / rng_ranks
             print(f"[resume] continuing from epoch {start_epoch} -> {epochs} "
                   f"(best_val_loss so far {best_val_loss:.6f})")
 
@@ -1291,6 +1297,13 @@ class SAM3TrainerNative:
                 "epochs": epochs,
                 "batch": int(_tr.get("batch_size", 0)),
                 "grad_accum": int(_tr.get("gradient_accumulation_steps", 1)),
+                # A1.27 item 152(b): budget_row divides micro-steps by
+                # world_size too, else a 2-GPU run reports 2x the optimizer
+                # steps it took. effective_batch = micro x accum x ranks.
+                "world_size": int(self.world_size),
+                "effective_batch": int(_tr.get("batch_size", 0))
+                * int(_tr.get("gradient_accumulation_steps", 1))
+                * int(self.world_size),
                 "n_train_tiles": len(train_ds),
                 "n_val_tiles": len(val_ds) if has_validation else 0,
                 "seed": int(_tr.get("seed", 42)),
@@ -1304,9 +1317,13 @@ class SAM3TrainerNative:
             # (construction draws nothing) and immediately before the first
             # iter(train_loader) draws base_seed - the point at which the
             # uninterrupted run's state is the checkpointed state.
-            _rs.restore_rng(self._rng_to_restore)
+            # A1.27 item 152(c): each rank restores ITS OWN streams (rng_ranks)
+            # - a flat single-GPU file restores the same streams everywhere.
+            _rs.restore_rng(_rs.rng_for_rank(self._rng_to_restore,
+                                             get_rank() if self.multi_gpu else 0))
             del self._rng_to_restore
-            print("[resume] RNG streams restored (python / numpy / torch cpu / cuda)")
+            print_rank0("[resume] RNG streams restored (python / numpy / torch cpu / cuda"
+                        + (f"; per-rank x{self.world_size}" if self.multi_gpu else "") + ")")
 
         for epoch in range(start_epoch, epochs):
             # Set epoch for distributed / weighted samplers (per-epoch reshuffle)
@@ -1477,6 +1494,10 @@ class SAM3TrainerNative:
             # validation pass (which draws the val loader's base_seed) and the
             # val_stats append - so the saved RNG state is exactly what epoch
             # k+1 will consume. Atomic; ~112 MB; never archived.
+            # A1.27 item 152(c): gather_rng_all is a COLLECTIVE - every rank
+            # must call it, before the rank-0-only save.
+            _rng_all = _rs.gather_rng_all(get_rank() if self.multi_gpu else 0,
+                                          self.world_size if self.multi_gpu else 1)
             if is_main_process():
                 _m = self.model.module if self.multi_gpu else self.model
                 _rs.save_state(out_dir / _rs.STATE_NAME,
@@ -1487,7 +1508,8 @@ class SAM3TrainerNative:
                                meta={"seed": int(self.config["training"].get("seed", 42)),
                                      "n_train_tiles": len(train_ds),
                                      "output_dir": str(out_dir),
-                                     "epochs": epochs})
+                                     "epochs": epochs},
+                               rng_ranks=_rng_all)
 
         # Synchronize before final save
         if self.multi_gpu:

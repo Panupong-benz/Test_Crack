@@ -125,15 +125,22 @@ def _read_decision(path: Path) -> dict:
 
 
 def _write_cfg(base_config: Path, data_root: str, fold: str, seed: int,
-               epochs: int, cfg_path: Path):
+               epochs: int, cfg_path: Path, gpus: int = 1):
     import yaml
     base = yaml.safe_load(Path(base_config).read_text(encoding="utf-8"))
     tag = f"a6_{fold}_s{seed}"
-    cfg = override_keys(base, f"{data_root}/fold_{fold}", seed, f"runs/{tag}")
+    cfg = override_keys(base, f"{data_root}/fold_{fold}", seed, f"runs/{tag}",
+                        gpus=gpus)
     cfg["training"]["num_epochs"] = int(epochs)   # AFTER the walk (A1.21 item 114)
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     return cfg
+
+
+def _dev(gpus: int) -> list:
+    """--device 0..N-1 for N>1 (trainer self-launches torchrun); [] for 1 so
+    single-GPU commands are byte-identical to pre-A1.27 (A1.27 item 152(d))."""
+    return (["--device"] + [str(i) for i in range(gpus)]) if gpus > 1 else []
 
 
 def _launch(cmd, dry_run: bool) -> int:
@@ -167,11 +174,13 @@ def cmd_extend(a) -> int:
     if (run / "best_lora_weights.pt").exists():
         shutil.copy2(run / "best_lora_weights.pt", run / f"best_lora_weights.B{base}.pt")
     cfg_path = Path(a.config_dir) / f"{tag}_e{chosen}.yaml"
-    _write_cfg(Path(a.base_config), a.data_root, fold, seed, chosen, cfg_path)
+    _write_cfg(Path(a.base_config), a.data_root, fold, seed, chosen, cfg_path,
+               gpus=getattr(a, "gpus", 1))
     print(f"[extend] {tag}: {base} -> {chosen} epochs via --resume "
           f"(config {cfg_path})")
     rc = _launch([sys.executable if a.dry_run else "python3", a.trainer,
-                  "--config", cfg_path.as_posix(), "--resume"], a.dry_run)
+                  "--config", cfg_path.as_posix(), "--resume"] + _dev(getattr(a, "gpus", 1)),
+                 a.dry_run)
     if rc == 0 and not a.dry_run:
         (run / "EXTENDED").write_text(f"{base}->{chosen}\n")
     return rc
@@ -183,11 +192,13 @@ def cmd_train(a) -> int:
     chosen = int(d["chosen_budget"])
     tag = f"a6_{a.fold}_s{a.seed}"
     cfg_path = Path(a.config_dir) / f"{tag}.yaml"
-    _write_cfg(Path(a.base_config), a.data_root, a.fold, a.seed, chosen, cfg_path)
+    _write_cfg(Path(a.base_config), a.data_root, a.fold, a.seed, chosen, cfg_path,
+               gpus=getattr(a, "gpus", 1))
     print(f"[train] {tag} at the row's decided budget {chosen} "
           f"(pilot {d['pilot_run']} verdict {d['verdict']})")
     return _launch([sys.executable if a.dry_run else "python3", a.trainer,
-                    "--config", cfg_path.as_posix(), "--resume"], a.dry_run)
+                    "--config", cfg_path.as_posix(), "--resume"] + _dev(getattr(a, "gpus", 1)),
+                   a.dry_run)
 
 
 # ---------------------------------------------------------------- selftest --
@@ -279,6 +290,9 @@ def main(argv=None) -> int:
         sp.add_argument("--data-root", default="data")
         sp.add_argument("--trainer", default="train_sam3_lora_native_claude.py")
         sp.add_argument("--dry-run", action="store_true")
+        sp.add_argument("--gpus", type=int, default=1,
+                        help="A1.27: GPUs per training; N>1 adds --device and "
+                             "divides grad accumulation by N (make_jobs passes it)")
 
     d = sub.add_parser("decide")
     d.add_argument("--pilot-run", required=True)

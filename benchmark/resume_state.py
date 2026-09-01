@@ -74,10 +74,40 @@ def restore_rng(state: dict) -> None:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+# A1.27 item 152(c): under DDP every rank owns its own four streams. The
+# single-GPU format keeps `rng` (flat, rank 0) so old files and old runs are
+# byte-identical; multi-GPU adds `rng_ranks` = {rank: streams} gathered on
+# rank 0 at save time, and each rank restores ITS OWN entry.
+def gather_rng_all(rank: int, world_size: int) -> dict:
+    """{rank: capture_rng()} for every rank (all_gather_object); {0: ...} when
+    not distributed. Every rank must call this (it is a collective)."""
+    mine = capture_rng()
+    if world_size <= 1:
+        return {0: mine}
+    import torch.distributed as dist
+    buf = [None] * world_size
+    dist.all_gather_object(buf, mine)
+    return {r: st for r, st in enumerate(buf)}
+
+
+def rng_for_rank(st: dict, rank: int) -> dict:
+    """The streams THIS rank must restore: rng_ranks[rank] when the file
+    carries per-rank streams, else the flat (legacy / single-GPU) `rng`."""
+    per = st.get("rng_ranks")
+    if per:
+        if rank not in per:
+            raise SystemExit(f"resume: ckpt has RNG for ranks {sorted(per)}, "
+                             f"not rank {rank} - world size changed?")
+        return per[rank]
+    return st["rng"]
+
+
 # ------------------------------------------------------------ save / load ---
 def save_state(path: Path, *, lora_sd: dict, optimizer_sd: dict,
-               epoch_completed: int, best_val_loss: float, meta: dict) -> None:
-    """Atomic: a kill mid-write leaves the previous file intact."""
+               epoch_completed: int, best_val_loss: float, meta: dict,
+               rng_ranks: dict = None) -> None:
+    """Atomic: a kill mid-write leaves the previous file intact.
+    rng_ranks = gather_rng_all(...) under DDP; None = single process."""
     path = Path(path)
     payload = {
         "format": FORMAT,
@@ -85,9 +115,11 @@ def save_state(path: Path, *, lora_sd: dict, optimizer_sd: dict,
         "best_val_loss": float(best_val_loss),
         "lora": {k: v.detach().cpu() for k, v in lora_sd.items()},
         "optimizer": optimizer_sd,
-        "rng": capture_rng(),
+        "rng": (rng_ranks[0] if rng_ranks else capture_rng()),
         "meta": dict(meta),
     }
+    if rng_ranks and len(rng_ranks) > 1:
+        payload["rng_ranks"] = dict(rng_ranks)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     os.replace(tmp, path)
@@ -283,6 +315,34 @@ def _selftest() -> int:
         assert st_f.read_bytes() == before
         load_state(st_f)
         print("  atomic save: torn .tmp leaves the previous state loadable")
+
+        # A1.27 item 152(c): per-rank RNG round-trip through save/load, and
+        # the legacy flat file still restores on every rank
+        r0, r1 = capture_rng(), None
+        random.random(); np.random.rand(); torch.rand(1)     # advance -> differs
+        r1 = capture_rng()
+        assert r0["torch_cpu"].tolist() != r1["torch_cpu"].tolist()
+        pr = c / "per_rank.pt"
+        save_state(pr, lora_sd={}, optimizer_sd={}, epoch_completed=1,
+                   best_val_loss=1.0, meta={}, rng_ranks={0: r0, 1: r1})
+        st2 = load_state(pr)
+        assert st2["rng_ranks"] and sorted(st2["rng_ranks"]) == [0, 1]
+        assert rng_for_rank(st2, 1)["torch_cpu"].tolist() == r1["torch_cpu"].tolist()
+        assert rng_for_rank(st2, 0)["torch_cpu"].tolist() == r0["torch_cpu"].tolist()
+        assert st2["rng"]["torch_cpu"].tolist() == r0["torch_cpu"].tolist(), (
+            "flat rng must stay rank 0 so single-GPU readers are unchanged")
+        try:
+            rng_for_rank(st2, 2)
+            raise AssertionError("rank outside the saved set was accepted")
+        except SystemExit:
+            pass
+        legacy = load_state(st_f)                    # written by _toy_run (1 proc)
+        assert "rng_ranks" not in legacy
+        assert rng_for_rank(legacy, 0) is legacy["rng"]
+        assert rng_for_rank(legacy, 1) is legacy["rng"], "flat file serves every rank"
+        assert gather_rng_all(0, 1).keys() == {0}
+        print("  per-rank RNG: {0,1} round-trip, rank 0 == flat rng, unknown rank refused,"
+              " legacy flat file restores on any rank")
 
         # meta + key guards
         try:

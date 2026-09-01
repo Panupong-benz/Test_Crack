@@ -53,7 +53,7 @@ GB = 1024 ** 3
 FIELDS = ["ts", "disk_used_gb", "disk_free_gb",
           "vram_used_mb", "vram_total_mb", "gpu_util_pct", "power_w",
           "ram_used_gb", "ram_total_gb", "running_job",
-          "runs_gb", "hf_cache_gb", "pool_gb"]
+          "runs_gb", "hf_cache_gb", "pool_gb", "n_gpu"]
 
 
 # ----------------------------------------------------------------- readers -
@@ -74,10 +74,33 @@ def read_gpu():
              "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=15)
-        parts = [p.strip() for p in r.stdout.strip().splitlines()[0].split(",")]
-        return tuple(parts[:4])
+        return aggregate_gpu_lines(r.stdout)
     except Exception:                                        # noqa: BLE001
-        return "", "", "", ""
+        return "", "", "", "", ""
+
+
+def aggregate_gpu_lines(text: str):
+    """(vram_used_max, vram_total_of_that_gpu, util_mean, power_sum, n_gpu).
+    A1.27 item 152(f): the old reader took line 0 = GPU 0 only, so on a 2x
+    box the second card was invisible. VRAM is reported as the busiest
+    card (that is the OOM question), util as the mean, power as the sum."""
+    rows = []
+    for line in text.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            rows.append((float(parts[0]), float(parts[1]),
+                         float(parts[2]), float(parts[3])))
+        except ValueError:
+            continue
+    if not rows:
+        return "", "", "", "", ""
+    used, total, util, power = max(rows, key=lambda r: r[0])[:2] + (0, 0)
+    util = sum(r[2] for r in rows) / len(rows)
+    power = sum(r[3] for r in rows)
+    fmt = lambda v: (str(int(v)) if float(v).is_integer() else f"{v:.2f}".rstrip("0").rstrip("."))
+    return fmt(used), fmt(total), fmt(round(util, 2)), fmt(round(power, 2)), str(len(rows))
 
 
 def read_ram():
@@ -118,7 +141,7 @@ def du_gb(path: Path):
 
 def sample(watch: Path, queue_state: Path, with_du: bool, du_paths: dict):
     used, free = read_disk(watch)
-    vram_u, vram_t, util, power = read_gpu()
+    vram_u, vram_t, util, power, n_gpu = read_gpu()
     ram_u, ram_t = read_ram()
     row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "disk_used_gb": used, "disk_free_gb": free,
@@ -126,7 +149,7 @@ def sample(watch: Path, queue_state: Path, with_du: bool, du_paths: dict):
            "gpu_util_pct": util, "power_w": power,
            "ram_used_gb": ram_u, "ram_total_gb": ram_t,
            "running_job": read_running(queue_state),
-           "runs_gb": "", "hf_cache_gb": "", "pool_gb": ""}
+           "runs_gb": "", "hf_cache_gb": "", "pool_gb": "", "n_gpu": n_gpu}
     if with_du:
         row["runs_gb"] = du_gb(du_paths.get("runs"))
         row["hf_cache_gb"] = du_gb(du_paths.get("hf"))
@@ -256,6 +279,15 @@ def report(args):
 # ---------------------------------------------------------------- selftest -
 def selftest():
     import tempfile
+    # 0. A1.27: two nvidia-smi lines -> busiest card VRAM, mean util, sum W
+    two = "15873, 32607, 98, 410.5" + chr(10) + "15100, 32607, 90, 380.5" + chr(10)
+    u, t, ut, pw, n = aggregate_gpu_lines(two)
+    assert (u, t, n) == ("15873", "32607", "2"), (u, t, n)
+    assert ut == "94" and pw == "791", (ut, pw)
+    one = aggregate_gpu_lines("15873, 32607, 98, 410.5")
+    assert one == ("15873", "32607", "98", "410.5", "1"), one
+    assert aggregate_gpu_lines("") == ("", "", "", "", ""), "no nvidia-smi -> blanks"
+    print("  aggregate_gpu_lines: 2 cards -> max VRAM / mean util / sum power; 1 card unchanged")
     # 1. report math on planted rows, including blank GPU cells
     rows = [
         {"ts": "t1", "disk_used_gb": "20.0", "disk_free_gb": "40.0",

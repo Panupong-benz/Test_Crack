@@ -27,6 +27,11 @@ SMOKE_DIR="/workspace/smoke"              # scratch dir for the smoke fold + con
 N_TRAIN=8                                 # images sampled into the smoke train split
 N_EVAL=3                                  # images for valid and for test (each)
 TIMEOUT=900                               # hard cap (s) in case it hangs
+# A1.27: GPU ids for the trainer. "0" = single GPU (unchanged). "0 1" = the
+# trainer self-launches torchrun on both; grad accumulation is divided by
+# the count so the effective batch stays what the real queue uses.
+DEVICES="${BM_DEVICES:-0}"
+N_GPU=$(echo ${DEVICES} | wc -w)
 # ========================================================
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -71,13 +76,18 @@ PY
 
 # ---------- write a 1-epoch smoke config ----------
 say "writing smoke config (num_epochs=1, no checkpointing)"
-python3 - "$FULL_CONFIG" "$SMOKE_CFG" "$SMOKE_FOLD" <<'PY'
+python3 - "$FULL_CONFIG" "$SMOKE_CFG" "$SMOKE_FOLD" "$N_GPU" <<'PY'
 import sys, yaml
-full, out, fold = sys.argv[1], sys.argv[2], sys.argv[3]
+full, out, fold, ngpu = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 cfg = yaml.safe_load(open(full))
 t = cfg.setdefault("training", {})
 t["data_dir"]   = fold
 t["num_epochs"] = 1
+if ngpu > 1:   # A1.27 item 150: same rule as make_jobs.override_keys
+    acc = int(t.get("gradient_accumulation_steps", 1))
+    assert acc % ngpu == 0, f"accum {acc} not divisible by {ngpu} GPUs"
+    t["gradient_accumulation_steps"] = acc // ngpu
+    print(f"  {ngpu} GPUs -> gradient_accumulation_steps {acc} -> {acc // ngpu}")
 t["save_steps"] = 10**9          # effectively never mid-epoch checkpoint
 t["save_total_limit"] = 1
 yaml.safe_dump(cfg, open(out, "w"), sort_keys=False)
@@ -91,7 +101,8 @@ mon_pid=""
 if [[ $have_smi -eq 1 ]]; then
   ( peak=0
     while true; do
-      u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+      # max over cards (A1.27): the busiest GPU is the OOM question
+      u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | sort -n | tail -1)
       [[ "$u" =~ ^[0-9]+$ ]] && (( u > peak )) && { peak=$u; echo "$peak" > "${VRAM_FILE}"; }
       sleep 1
     done ) & mon_pid=$!
@@ -106,7 +117,8 @@ trap stop_mon EXIT INT TERM
 say "running 1 epoch (timeout ${TIMEOUT}s) — log: ${LOG}"
 echo "============================================================"
 start=$(date +%s)
-timeout "${TIMEOUT}" python3 train_sam3_lora_native_claude.py --config "${SMOKE_CFG}" 2>&1 | tee "${LOG}"
+say "devices: ${DEVICES} (${N_GPU} GPU)"
+timeout "${TIMEOUT}" python3 train_sam3_lora_native_claude.py --config "${SMOKE_CFG}" --device ${DEVICES} 2>&1 | tee "${LOG}"
 rc=${PIPESTATUS[0]}
 end=$(date +%s)
 echo "============================================================"
@@ -143,17 +155,21 @@ fi
 
 # rough full-run extrapolation
 if [[ -n "${its:-}" && -n "${steps:-}" ]]; then
-  python3 - "$its" "$steps" "$N_TRAIN" "$SRC_FOLD" "$FULL_CONFIG" <<'PY'
+  python3 - "$its" "$steps" "$N_TRAIN" "$SRC_FOLD" "$FULL_CONFIG" "$N_GPU" <<'PY'
 import sys, json, os, yaml
 its=float(sys.argv[1]); smoke_steps=int(sys.argv[2].split('/')[-1])
-ntr=int(sys.argv[3]); src=sys.argv[4]; full=sys.argv[5]
+ntr=int(sys.argv[3]); src=sys.argv[4]; full=sys.argv[5]; ngpu=int(sys.argv[6])
+# A1.27: the bar counts rank-0 steps = tiles/(bs*ngpu); scale back to tiles
+smoke_steps *= ngpu
 cfg=yaml.safe_load(open(full)); t=cfg.get("training",{})
 bs=t.get("batch_size",2); epochs=t.get("num_epochs",30)
 real=len(json.load(open(os.path.join(src,"train","_annotations.coco.json")))["images"])
 tiles_per_img = smoke_steps*bs/max(ntr,1)
 real_steps = tiles_per_img*real/bs
 sec = real_steps*epochs/max(its,1e-6)
-print(f"[extrapolate] ~{tiles_per_img:.1f} tiles/img -> ~{real_steps:.0f} steps/epoch x {epochs} ep")
+real_steps /= ngpu   # per-rank steps at the measured per-rank it/s
+sec = real_steps*epochs/max(its,1e-6)
+print(f"[extrapolate] ~{tiles_per_img:.1f} tiles/img -> ~{real_steps:.0f} steps/epoch/GPU x {epochs} ep on {ngpu} GPU")
 print(f"[extrapolate] this fold (~{real} imgs): ~{sec/60:.0f} min  (~{sec/3600:.1f} h)  at {its} it/s")
 # "roughly double" was written for the July 2-fold set and understates a
 # 4-fold LOWO run by ~2x - the number the operator reads before committing
