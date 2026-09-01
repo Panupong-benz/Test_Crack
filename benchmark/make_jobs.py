@@ -81,6 +81,10 @@ def main():
                          "must live in a committable command - a hand-"
                          "edited YAML is silently erased by the next "
                          "make_jobs run.")
+    ap.add_argument("--a6-ext", type=int, default=None,
+                    help="A6 extended budget when the pilot fold is "
+                         "budget_limited (A1.22 item 117). Default None = 2 x "
+                         "the base budget. Whole row moves together.")
     ap.add_argument("--marked-list", default="marked_line_images.txt")
     ap.add_argument("--results", default="results/benchmark")
     ap.add_argument("--nnunet-id-base", type=int, default=501)
@@ -148,23 +152,42 @@ def main():
                             "smoke", out_name="smoke_eval.csv"), after=prev)
 
     # ---- A6 SAM3-LoRA: kill-gate run first, then the rest ----------------
-    def a6_jobs(fold, seed, after, gate=False):
+    _adaptive_common = (f"--results {args.results} "
+                        f"--config-dir {args.config_dir.as_posix()} "
+                        f"--base-config {args.base_config.as_posix()} "
+                        f"--data-root {args.data_root}")
+
+    def a6_jobs(fold, seed, after, gate=False, adaptive=False):
         """gate=True keeps the whole chain non-optional and returns the EVAL
         (the kill-gate: a bad gate must stop the queue before the expensive
         rest). Otherwise infer/eval are optional leaves and the TRAIN is
-        returned, so the chain advances through trainings only (A1.5)."""
+        returned, so the chain advances through trainings only (A1.5).
+
+        adaptive=True (every A6 run except the pilot, A1.22 item 117): the
+        config is written at RUN time by `a6_adaptive.py train` at the budget
+        the pilot's `decide` job recorded - it hard-fails without a decision
+        file, never defaulting silently."""
         tag = f"a6_{fold}_s{seed}"
-        cfg = override_keys(base_cfg, f"{args.data_root}/fold_{fold}",
-                            seed, f"runs/{tag}")
-        if args.a6_epochs:
-            # set AFTER override_keys - its key-name walk would clobber every
-            # num_epochs in the tree (A1.21 item 114)
-            cfg["training"]["num_epochs"] = int(args.a6_epochs)
-        cfg_path = args.config_dir / f"{tag}.yaml"
-        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False),
-                            encoding="utf-8")
-        t = add(tag, f"python3 train_sam3_lora_native_claude.py "
-                     f"--config {cfg_path.as_posix()}", after=after)
+        if adaptive:
+            t = add(tag, f"python3 benchmark/a6_adaptive.py train "
+                         f"--fold {fold} --seed {seed} {_adaptive_common}",
+                    after=after)
+        else:
+            cfg = override_keys(base_cfg, f"{args.data_root}/fold_{fold}",
+                                seed, f"runs/{tag}")
+            if args.a6_epochs:
+                # set AFTER override_keys - its key-name walk would clobber
+                # every num_epochs in the tree (A1.21 item 114)
+                cfg["training"]["num_epochs"] = int(args.a6_epochs)
+            cfg_path = args.config_dir / f"{tag}.yaml"
+            cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False),
+                                encoding="utf-8")
+            # --resume on EVERY A6 train (A1.22 item 120): no ckpt_state.pt =
+            # fresh start, so the identical command re-run by queue_runner
+            # after a kill continues from the last completed epoch instead of
+            # epoch 0 (the A1.21 item 107 risk, closed).
+            t = add(tag, f"python3 train_sam3_lora_native_claude.py "
+                         f"--config {cfg_path.as_posix()} --resume", after=after)
         # weight filename confirmed at smoke hour; find keeps it layout-proof
         i = add(f"infer_{tag}",
                 f"python3 benchmark/run_a5_zeroshot.py "
@@ -181,12 +204,46 @@ def main():
         # GATE: queue_runner stops here automatically if the gate run fails;
         # the clDice-vs-old-checkpoint judgement (runbook 4b) is a manual read
         # of eval_a6_<fold0>_s0 before letting the queue continue overnight.
-        last = gate
+
+        # ---- A1.22 upward-only budget rule, as static jobs ---------------
+        # The pilot's B-epoch curve is judged by the FROZEN A1.7 criterion;
+        # budget_limited -> the WHOLE row goes to EXT: the pilot continues via
+        # --resume (same program: prefix property), later folds train at EXT
+        # from scratch. Both decide and extend are non-optional: an
+        # unreadable curve must stop the queue, and a failed extension must
+        # not let later folds proceed at a budget the pilot never reached.
+        f0, s0 = args.folds[0], args.seeds[0]
+        pilot = f"a6_{f0}_s{s0}"
+        B = int(args.a6_epochs or base_cfg["training"]["num_epochs"])
+        EXT = int(args.a6_ext or 2 * B)
+        dec = add(f"decide_{pilot}",
+                  f"python3 benchmark/a6_adaptive.py decide "
+                  f"--pilot-run runs/{pilot} --base {B} --ext {EXT} "
+                  f"{_adaptive_common}", after=gate)
+        ext = add(f"extend_{pilot}",
+                  f"python3 benchmark/a6_adaptive.py extend --run runs/{pilot} "
+                  f"{_adaptive_common}", after=dec)
+        # post-extension infer/eval: no-ops unless EXTENDED exists. Masks go
+        # to masks_x and are swapped in only on success, so a mid-way failure
+        # never leaves a half-overwritten mask dir beside a stale eval CSV.
+        guard = f"[ -f runs/{pilot}/EXTENDED ] || exit 0; "
+        ix = add(f"inferx_{pilot}",
+                 guard + f"python3 benchmark/run_a5_zeroshot.py "
+                 f"--fold {args.data_root}/fold_{f0} --out runs/{pilot}/masks_x "
+                 f"--weights \"$(find runs/{pilot} -name best_lora_weights.pt "
+                 f"| head -1)\" && rm -rf runs/{pilot}/masks_B{B} "
+                 f"&& mv runs/{pilot}/masks runs/{pilot}/masks_B{B} "
+                 f"&& mv runs/{pilot}/masks_x runs/{pilot}/masks",
+                 after=ext, optional=True)
+        add(f"evalx_{pilot}",
+            guard + eval_cmd(f0, f"runs/{pilot}/masks", pilot),
+            after=ix, optional=True)
+        last = ext
         for fold in args.folds:
             for seed in args.seeds:
-                if fold == args.folds[0] and seed == args.seeds[0]:
+                if fold == f0 and seed == s0:
                     continue
-                last = a6_jobs(fold, seed, last)
+                last = a6_jobs(fold, seed, last, adaptive=True)
 
     # ---- A5 zero-shot (no training; cheap, right after the gate) ---------
     # no training here, so these are leaves off the last A6 train: one failed

@@ -12,3 +12,10 @@ jobs:
   - name: smoke_sam3
     after: smoke_eval_unit
     cmd: bash smoke_test.sh
+  # A1.22: exact-resume proof on the REAL trainer + GPU (AdamW8bit state
+  # round-trip cannot be tested on the dev box). Resumes the 1-epoch smoke to
+  # 2 epochs, runs a straight 2-epoch twin, asserts identical epoch-2 data
+  # fingerprints. ~2 extra smoke epochs. Must PASS before `full`.
+  - name: smoke_resume
+    after: smoke_sam3
+    cmd: python3 benchmark/smoke_resume.py

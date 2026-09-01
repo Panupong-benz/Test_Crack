@@ -61,6 +61,7 @@ SPEC = [
     # val_stats.prev<k>.json (A1.21 item 111) - the only surviving record
     # that a restart happened. A few KB each.
     (REPO / "runs", "*/val_stats*.json", False),
+    (REPO / "runs", "*/EXTENDED", False),           # A1.22 extension marker
     (REPO / "runs", "*/DONE", False),
     (REPO / "runs", "*/best.pt", False),
     (REPO / "runs", "*/best_lora_weights.pt", False),

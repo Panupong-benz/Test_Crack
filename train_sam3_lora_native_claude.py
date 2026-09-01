@@ -48,6 +48,24 @@ from sam3.model.model_misc import SAM3Output
 from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
+
+# A1.22: exact-resume helpers live in benchmark/ so they can be proven on a
+# box that cannot import this file (no sam3/triton/bitsandbytes there).
+_BENCH_DIR = Path(__file__).resolve().parent / "benchmark"
+if _BENCH_DIR.exists() and str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
+import resume_state as _rs  # noqa: E402
+
+
+def _lora_state(model):
+    """Same keys save_lora_weights() writes: <module>.lora_A / .lora_B."""
+    from lora_layers import LoRALayer
+    out = {}
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALayer):
+            out[f"{name}.lora_A"] = module.lora_A
+            out[f"{name}.lora_B"] = module.lora_B
+    return out
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
@@ -812,10 +830,24 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
 
 class SAM3TrainerNative:
-    def __init__(self, config_path, multi_gpu=False):
+    def __init__(self, config_path, multi_gpu=False, resume=False):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
         self.config_path = str(config_path)   # recorded in run.json (A1.21)
+        self.resume = bool(resume)
+
+        # Seed EVERY source of randomness BEFORE the model is built (A1.22
+        # item 119). apply_lora_to_model() below runs LoRA's kaiming init on
+        # the global CPU RNG; until A1.22 the seed lived in train(), AFTER
+        # this point, so seeds 0/1/2 never controlled initialisation and the
+        # prefix-property certificate was an overclaim.
+        _seed = int(self.config["training"].get("seed", 42))
+        import random as _random
+        _random.seed(_seed)
+        np.random.seed(_seed)
+        torch.manual_seed(_seed)
+        torch.cuda.manual_seed_all(_seed)
+        print(f"[seed] all RNGs seeded with {_seed} (before model build)")
 
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
@@ -968,18 +1000,10 @@ class SAM3TrainerNative:
         )
         
     def train(self):
-        # Seed EVERY source of randomness, not just the sampler. Before this
-        # `seed` reached only WeightedDistributedSampler, so LoRA init,
-        # dropout and augmentation were unseeded and the benchmark's "3 seeds
-        # per row" measured something categorically different from the smp
-        # rows (benchmark_protocol Amendment A1 item 3 / A1.4).
-        _seed = int(self.config["training"].get("seed", 42))
-        import random as _random
-        _random.seed(_seed)
-        np.random.seed(_seed)
-        torch.manual_seed(_seed)
-        torch.cuda.manual_seed_all(_seed)
-        print(f"[seed] all RNGs seeded with {_seed}")
+        # Seeding lives in __init__ since A1.22 item 119: it used to sit HERE,
+        # after __init__ had already run apply_lora_to_model(), so LoRA's
+        # kaiming init was never seeded. Re-seeding here would also reset the
+        # streams the epoch loop consumes - deliberately not done.
 
         # A1.20: input is a fixed 1008x1008 tile on every step, which is
         # exactly the case cudnn autotuning exists for. benchmark/train_seg.py
@@ -1098,7 +1122,14 @@ class SAM3TrainerNative:
             collate_fn=collate_fn,
             num_workers=_nw,
             pin_memory=True,
-            persistent_workers=(_nw > 0),
+            # A1.22 item 120: persistent workers draw the DataLoader base_seed
+            # ONCE and then advance their numpy/torch streams across epochs in
+            # state the main process cannot checkpoint. A fresh iterator per
+            # epoch draws base_seed from the global torch CPU RNG, which the
+            # resume path restores - that is what makes epoch k+1 after a
+            # resume the same program as epoch k+1 uninterrupted. Cost: a
+            # worker respawn per epoch (seconds against a 44-minute epoch).
+            persistent_workers=False,
         )
         if _nw > 0:
             _loader_kwargs["prefetch_factor"] = int(
@@ -1170,7 +1201,15 @@ class SAM3TrainerNative:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         restarts = 0
-        if is_main_process():
+        _state_f = out_dir / _rs.STATE_NAME
+        _resumed = self.resume and _state_f.exists()
+        start_epoch = 0
+        _resumed_from = []
+        if self.resume and not _resumed:
+            print(f"[resume] no {_rs.STATE_NAME} in {out_dir} - fresh start")
+        if is_main_process() and not _resumed:
+            # (A1.22: on a resume this whole block is SKIPPED - rotating the
+            # curve away would orphan best_lora_weights.pt from val_stats.json)
             # A1.21 item 111: val_stats.json is appended per epoch and this
             # trainer has no --resume, so a retried job would CONCATENATE two
             # runs' curves (measured: best_epoch 12 read as 21, verdict
@@ -1195,9 +1234,55 @@ class SAM3TrainerNative:
                 print(f"[restart] rotated stale val_stats.json"
                       f"{' + best_lora_weights.pt' if (out_dir / f'best_lora_weights.prev{k}.pt').exists() else ''}"
                       f" -> .prev{k} (attempt {k + 1} starts a fresh curve)")
+        if _resumed:
+            # A1.22 item 120: exact continuation. Weights, optimizer moments,
+            # best_val_loss and the epoch counter all come from the SAME run
+            # (this is not the alternative A1.21 item 111 rejected - that one
+            # paired a dead attempt's weights with a new attempt's curve).
+            st = _rs.load_state(_state_f)
+            _rs.check_meta(st, {"seed": int(self.config["training"].get("seed", 42)),
+                                "n_train_tiles": len(train_ds),
+                                "output_dir": str(out_dir)})
+            _m = self.model.module if self.multi_gpu else self.model
+            _missing, _unexpected = _m.load_state_dict(st["lora"], strict=False)
+            _rs.assert_lora_keys_consumed(st["lora"].keys(),
+                                          _lora_state(_m).keys(), _unexpected)
+            self.optimizer.load_state_dict(st["optimizer"])
+            best_val_loss = float(st["best_val_loss"])
+            start_epoch = int(st["epoch_completed"])
+            if start_epoch >= epochs:
+                raise SystemExit(f"[resume] checkpoint already completed epoch "
+                                 f"{start_epoch} >= num_epochs {epochs}: nothing "
+                                 f"to do (raise num_epochs to extend)")
+            if best_val_loss < float("inf") and not (out_dir / "best_lora_weights.pt").exists():
+                raise SystemExit("[resume] best_lora_weights.pt missing although "
+                                 "best_val_loss is finite - was an attempt launched "
+                                 "WITHOUT --resume (rotation)? Restore the .prev "
+                                 "file first.")
+            if is_main_process():
+                _kept, _dropped = _rs.truncate_val_stats(out_dir / "val_stats.json",
+                                                         start_epoch)
+                if _dropped:
+                    print(f"[resume] dropped {_dropped} val_stats record(s) past "
+                          f"epoch {start_epoch} (kill landed between the append "
+                          f"and the state save)")
+                _rs.assert_contiguous(out_dir / "val_stats.json", start_epoch)
+            try:
+                _old = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                _old = {}
+            restarts = int(_old.get("restarts", 0) or 0)
+            _resumed_from = list(_old.get("resumed_from", []) or []) + [start_epoch]
+            self._rng_to_restore = st["rng"]
+            print(f"[resume] continuing from epoch {start_epoch} -> {epochs} "
+                  f"(best_val_loss so far {best_val_loss:.6f})")
+
+        if is_main_process():
             # A1.21 item 112: the budget travels WITH the run. budget_row
             # checks run.json before the per-run YAML, so epoch_saturation
             # no longer depends on a gitignored config surviving the tarball.
+            # A1.22: on a resume `epochs` is the NEW budget and resumed_from
+            # records every continuation point; restarts is preserved.
             _tr = self.config["training"]
             (out_dir / "run.json").write_text(json.dumps({
                 "epochs": epochs,
@@ -1208,15 +1293,26 @@ class SAM3TrainerNative:
                 "seed": int(_tr.get("seed", 42)),
                 "config_path": self.config_path,
                 "restarts": restarts,
+                "resumed_from": _resumed_from,
             }, indent=2))
 
-        for epoch in range(epochs):
+        if _resumed:
+            # A1.22: restored HERE, after every loader has been constructed
+            # (construction draws nothing) and immediately before the first
+            # iter(train_loader) draws base_seed - the point at which the
+            # uninterrupted run's state is the checkpointed state.
+            _rs.restore_rng(self._rng_to_restore)
+            del self._rng_to_restore
+            print("[resume] RNG streams restored (python / numpy / torch cpu / cuda)")
+
+        for epoch in range(start_epoch, epochs):
             # Set epoch for distributed / weighted samplers (per-epoch reshuffle)
             if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
                 train_sampler.set_epoch(epoch)
 
             # Track training losses for this epoch
             train_losses = []
+            _fp_epoch = None   # A1.22: exact identity of this epoch's first batch
 
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
@@ -1227,6 +1323,12 @@ class SAM3TrainerNative:
 
             for step, batch_dict in enumerate(pbar):
                 input_batch = batch_dict["input"]
+                if step == 0:
+                    # sum of the raw image batch BEFORE it moves to the device:
+                    # float-noise-immune, so smoke_resume can assert that a
+                    # resumed epoch sees exactly what a straight run sees
+                    _img = getattr(input_batch, "img_batch", None)
+                    _fp_epoch = _rs.fingerprint(_img) if _img is not None else None
 
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
@@ -1354,7 +1456,8 @@ class SAM3TrainerNative:
                         f.write(json.dumps({
                             "epoch": epoch + 1,
                             "train_loss": avg_train_loss,
-                            "val_loss": avg_val_loss
+                            "val_loss": avg_val_loss,
+                            "fingerprint": _fp_epoch,
                         }) + "\n")
 
                 torch.cuda.empty_cache()
@@ -1366,6 +1469,22 @@ class SAM3TrainerNative:
                 if is_main_process():
                     model_to_save = self.model.module if self.multi_gpu else self.model
                     save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+
+            # A1.22 item 120: full-state checkpoint, written LAST - after the
+            # validation pass (which draws the val loader's base_seed) and the
+            # val_stats append - so the saved RNG state is exactly what epoch
+            # k+1 will consume. Atomic; ~112 MB; never archived.
+            if is_main_process():
+                _m = self.model.module if self.multi_gpu else self.model
+                _rs.save_state(out_dir / _rs.STATE_NAME,
+                               lora_sd=_lora_state(_m),
+                               optimizer_sd=self.optimizer.state_dict(),
+                               epoch_completed=epoch + 1,
+                               best_val_loss=best_val_loss,
+                               meta={"seed": int(self.config["training"].get("seed", 42)),
+                                     "n_train_tiles": len(train_ds),
+                                     "output_dir": str(out_dir),
+                                     "epochs": epochs})
 
         # Synchronize before final save
         if self.multi_gpu:
@@ -1428,6 +1547,7 @@ def launch_distributed_training(args):
         sys.argv[0],  # This script
         "--config", args.config,
         "--device", *map(str, devices),
+        *(["--resume"] if getattr(args, "resume", False) else []),   # A1.22
         "--_launched_by_torchrun"  # Internal flag to indicate we're in subprocess
     ]
 
@@ -1467,6 +1587,14 @@ Examples:
         type=str,
         default="configs/full_lora_config.yaml",
         help="Path to YAML configuration file"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from <output_dir>/ckpt_state.pt if it exists (A1.22 "
+             "exact resume: LoRA + optimizer + epoch + RNG). No file = fresh "
+             "start, so the same command is safe to re-run after a kill. A "
+             "config with a larger num_epochs = extension of the same run."
     )
     parser.add_argument(
         "--device",
@@ -1511,5 +1639,6 @@ Examples:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device[0])
             print(f"Using single GPU: {args.device[0]}")
 
-        trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu)
+        trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu,
+                                    resume=args.resume)
         trainer.train()

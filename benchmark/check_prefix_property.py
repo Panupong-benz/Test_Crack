@@ -17,7 +17,13 @@ do silently.
 Checks over train_sam3_lora_native_claude.py:
   1. zero hits for any LR-scheduler construct or per-step LR mutation
   2. `num_epochs` is read exactly once
-  3. exactly one epoch loop, `for epoch in range(epochs)`
+  3. exactly one epoch loop, `for epoch in range([start_epoch,] epochs)` -
+     `start_epoch` (A1.22 resume) only skips epochs, it never changes what
+     epoch k does
+  4. the seed block precedes the apply_lora_to_model() CALL - until A1.22
+     the seed lived in train(), after __init__ had already run LoRA's
+     kaiming init, so seeds never controlled initialisation and the
+     "same RNG consumption" certificate was an overclaim (item 119)
 
 Exit 1 on any violation, naming the offending lines. Runs in milliseconds,
 no torch needed - wired into setup_benchmark.sh's selftest step so it runs
@@ -58,15 +64,27 @@ def main() -> int:
 
     bad = [(i, l.strip()) for i, l in enumerate(lines, 1) if FORBID.search(l)]
     n_read = sum(1 for l in lines if '["num_epochs"]' in l)
-    n_loop = sum(1 for l in lines if re.search(r"for epoch in range\(epochs\)", l))
+    # A1.22: `start_epoch` only SKIPS epochs (resume); it never changes what
+    # epoch k does, so the loop still counts as the single budget consumer
+    n_loop = sum(1 for l in lines if re.search(
+        r"for epoch in range\((?:start_epoch,\s*)?epochs\)", l))
+    # A1.22 item 119: seeding must precede the LoRA init. The CALL is matched,
+    # not the bare name - `apply_lora_to_model` also appears in the import.
+    i_seed = next((i for i, l in enumerate(lines, 1)
+                   if "torch.manual_seed(" in l), None)
+    i_lora = next((i for i, l in enumerate(lines, 1)
+                   if "apply_lora_to_model(self.model" in l), None)
+    seed_first = (i_seed is not None and i_lora is not None and i_seed < i_lora)
 
-    ok = (not bad) and n_read == 1 and n_loop == 1
+    ok = (not bad) and n_read == 1 and n_loop == 1 and seed_first
     print(f"prefix-property guard over {TRAINER.name}:")
     print(f"  scheduler/LR-mutation hits : {len(bad)} (must be 0)")
     for i, l in bad:
         print(f"    line {i}: {l}")
     print(f"  num_epochs reads           : {n_read} (must be 1)")
-    print(f"  'for epoch in range(epochs)': {n_loop} (must be 1)")
+    print(f"  epoch loop (start_epoch ok): {n_loop} (must be 1)")
+    print(f"  seed before LoRA init      : line {i_seed} < line {i_lora} "
+          f"-> {seed_first} (must be True)")
     if ok:
         print("PASS: constant LR, single budget read, single epoch loop - "
               "a shorter run is a prefix of a longer one")

@@ -234,8 +234,11 @@ def budget_row(run: Path, model: str, cfg_dir: Path, hours):
         # divide by grad_accum or A6's ~12,200 optimizer steps would be
         # reported as ~97,600. A2-A4 run.json has no grad_accum key -> 1.
         acc = int(j.get("grad_accum", 1) or 1)
+        rf = j.get("resumed_from") or ""
         row.update(epochs=ep or "", batch=bs or "", grad_accum=acc,
-                   n_train_tiles=tiles or "", budget_source="run.json")
+                   n_train_tiles=tiles or "", budget_source="run.json",
+                   resumed_from=("/".join(str(x) for x in rf)
+                                 if isinstance(rf, list) else rf))
         if ep and bs and tiles:
             row["optimizer_steps"] = (tiles // bs) * ep // acc
             row["samples_seen"] = tiles * ep
@@ -342,7 +345,8 @@ def collect(runs_dir: Path, results: Path, cfg_dir: Path,
         w = csv.DictWriter(fh, fieldnames=["run", "model", "epochs", "batch",
                                            "grad_accum", "n_train_tiles",
                                            "optimizer_steps", "samples_seen",
-                                           "hours", "budget_source"])
+                                           "hours", "budget_source",
+                                           "resumed_from"])
         w.writeheader()
         w.writerows(budgets)
     return rows
@@ -471,9 +475,35 @@ def selftest():
         assert int(b1["optimizer_steps"]) == (6000 // 2) * 30 // 8, (
             "grad_accum must divide micro-steps", b1)
         assert b1["budget_source"] == "run.json", b1
+    # A1.22: an extended run appends epochs 31..60 to the same file - that is
+    # a CONTINUATION (one block, restarts=0), not a restart, and the budget
+    # comes from the rewritten run.json (epochs=60, resumed_from=[30])
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        d = root / "runs" / "a6_F1_s0"
+        d.mkdir(parents=True)
+        curve = [300 * 0.82 ** min(i, 12) + 40 for i in range(1, 61)]
+        (d / "val_stats.json").write_text("".join(
+            json.dumps({"epoch": i, "train_loss": v, "val_loss": v}) + "\n"
+            for i, v in enumerate(curve, 1)))
+        (d / "run.json").write_text(json.dumps(
+            {"epochs": 60, "batch": 2, "grad_accum": 8, "n_train_tiles": 6000,
+             "restarts": 0, "resumed_from": [30]}))
+        res = root / "res"
+        rows3 = collect(root / "runs", res, root / "cfg",
+                        root / "queue_state.json", None)
+        r = rows3[0]
+        assert r["restarts"] == 0 and r["curve_ok"] == 1, r
+        assert r["epochs_logged"] == 60 and r["budget_epochs"] == 60, r
+        assert r["N"] == 6, r                       # tail_window(60)
+        bt3 = list(csv.DictReader(open(res / "budget_table.csv",
+                                       encoding="utf-8")))
+        assert bt3[0]["resumed_from"] == "30", bt3[0]
     print("selftest PASS: saturated / budget_limited / creeping->saturated "
           "(OR, not AND) / degenerate; mirrored for lower-is-better; "
           "N=3,4,25 for B=30,40,250; end-to-end runs/ scan + budget maths; "
+          "continued 1..60 curve = one block (restarts=0, budget 60, "
+          "resumed_from surfaced); "
           "concatenated curve -> last block only (restarts=1, curve_ok=0, "
           "ghost minimum ignored); unknown budget -> budget_known=0 + WARN; "
           "a6 optimizer steps divided by grad_accum")
