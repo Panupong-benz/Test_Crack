@@ -21,6 +21,9 @@ Multi-GPU Training:
 """
 
 import os
+import sys          # A1.25: line 55 uses sys.path AT IMPORT TIME; the only
+                    # other `import sys` sits inside the multi-GPU launcher
+                    # function, so module scope had no binding -> NameError
 import argparse
 import time
 import yaml

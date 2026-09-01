@@ -270,6 +270,17 @@ ENV
 echo "nnU-Net dirs + interpreter ($PYBIN) saved to $WORK/.bm_env"
 
 step "F. selftests (final gate)"
+# FIRST, because it is the cheapest gate and it is the class of failure that
+# reaches the box at all: names used at IMPORT TIME but never bound there.
+# The A6 trainer shipped with sys.path used at line 55 and no module-level
+# import sys, and NOTHING could catch it - the dev box cannot import that
+# file (no sam3/triton/bitsandbytes), so it first ran on rented hardware
+# (Amendment A1.25). Pure AST, no deps, ~0.2 s.
+python3 benchmark/check_module_scope.py --selftest || die "module-scope selftest FAILED"
+python3 benchmark/check_module_scope.py || die "module-scope guard FAILED - the
+file named above raises NameError the moment Python imports it. Fix it in the
+repo and git pull; do NOT patch it on the instance (collect_results records the
+git SHA as the provenance of this run)."
 python3 benchmark/eval_masks.py --selftest || die "eval_masks selftest FAILED"
 # to_nnunet runs only in the LAST block of the queue (row A1), so a bad
 # dataset.json or label range would surface after every training hour was
