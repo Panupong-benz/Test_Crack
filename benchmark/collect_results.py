@@ -65,12 +65,16 @@ SPEC = [
     (REPO / "runs", "*/DONE", False),
     (REPO / "runs", "*/best.pt", False),
     (REPO / "runs", "*/best_lora_weights.pt", False),
-    # A1.20 item 107: the A6 trainer has NO --resume, so a fold killed
-    # mid-training restarts at epoch 0 - and if it is killed before its
-    # first validation epoch completes, best_lora_weights.pt does not
-    # exist yet and last_* is the only surviving LoRA. 74 MB/fold.
+    # A killed fold now resumes (A1.22 item 120), but if it is killed
+    # before its first validation epoch completes, best_lora_weights.pt
+    # does not exist yet and last_* is the only surviving LoRA. 74 MB/fold.
     (REPO / "runs", "*/last_lora_weights.pt", False),
     (REPO / "runs", "*/masks/**/*", True),
+    # A1.23 item 130: the GT those masks are scored against. Without it the
+    # archive holds predictions that cannot be turned back into a metric or
+    # a figure anywhere but the instance that is about to be wiped
+    # (~5 MB/fold, against 74 MB/fold of weights already in here).
+    (REPO / "data", "fold_*/test/_annotations.coco.json", True),
     (REPO / "runs", "*.log", True),
     # A1.21 item 110: the arcname is p.relative_to(root.parent), so the root
     # must be REPO/configs (parent REPO) for the yaml to unpack at
