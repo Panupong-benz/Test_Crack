@@ -125,12 +125,13 @@ def _read_decision(path: Path) -> dict:
 
 
 def _write_cfg(base_config: Path, data_root: str, fold: str, seed: int,
-               epochs: int, cfg_path: Path, gpus: int = 1):
+               epochs: int, cfg_path: Path, gpus: int = 1,
+               num_workers=None):
     import yaml
     base = yaml.safe_load(Path(base_config).read_text(encoding="utf-8"))
     tag = f"a6_{fold}_s{seed}"
     cfg = override_keys(base, f"{data_root}/fold_{fold}", seed, f"runs/{tag}",
-                        gpus=gpus)
+                        gpus=gpus, num_workers=num_workers)
     cfg["training"]["num_epochs"] = int(epochs)   # AFTER the walk (A1.21 item 114)
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -175,7 +176,8 @@ def cmd_extend(a) -> int:
         shutil.copy2(run / "best_lora_weights.pt", run / f"best_lora_weights.B{base}.pt")
     cfg_path = Path(a.config_dir) / f"{tag}_e{chosen}.yaml"
     _write_cfg(Path(a.base_config), a.data_root, fold, seed, chosen, cfg_path,
-               gpus=getattr(a, "gpus", 1))
+               gpus=getattr(a, "gpus", 1),
+               num_workers=getattr(a, "num_workers", None))
     print(f"[extend] {tag}: {base} -> {chosen} epochs via --resume "
           f"(config {cfg_path})")
     rc = _launch([sys.executable if a.dry_run else "python3", a.trainer,
@@ -193,7 +195,8 @@ def cmd_train(a) -> int:
     tag = f"a6_{a.fold}_s{a.seed}"
     cfg_path = Path(a.config_dir) / f"{tag}.yaml"
     _write_cfg(Path(a.base_config), a.data_root, a.fold, a.seed, chosen, cfg_path,
-               gpus=getattr(a, "gpus", 1))
+               gpus=getattr(a, "gpus", 1),
+               num_workers=getattr(a, "num_workers", None))
     print(f"[train] {tag} at the row's decided budget {chosen} "
           f"(pilot {d['pilot_run']} verdict {d['verdict']})")
     return _launch([sys.executable if a.dry_run else "python3", a.trainer,
@@ -293,6 +296,11 @@ def main(argv=None) -> int:
         sp.add_argument("--gpus", type=int, default=1,
                         help="A1.27: GPUs per training; N>1 adds --device and "
                              "divides grad accumulation by N (make_jobs passes it)")
+        sp.add_argument("--num-workers", type=int, default=None,
+                        help="A1.28 item 157(d): DataLoader workers per rank. "
+                             "None = the base config value. make_jobs passes "
+                             "it so every fold of the row trains with the same "
+                             "loader settings as the pilot.")
 
     d = sub.add_parser("decide")
     d.add_argument("--pilot-run", required=True)

@@ -1185,8 +1185,14 @@ class SAM3TrainerNative:
             print_rank0(f"Training samples: {len(train_ds)}")
             print_rank0("⚠️  No validation data found - training without validation")
 
-        if self.multi_gpu:
-            print_rank0(f"Effective batch size: {self.config['training']['batch_size']} x {self.world_size} = {self.config['training']['batch_size'] * self.world_size}")
+        # A1.28 item 157(b): micro x accum x ranks. The old form omitted
+        # grad accumulation and printed 2 x 4 = 8 at world=4, while
+        # run.json recorded the true 16 - and A1.27 item 153 gates the
+        # paid queue on reading this line.
+        _micro = int(self.config["training"]["batch_size"])
+        _acc = int(self.config["training"].get("gradient_accumulation_steps", 1))
+        print_rank0(f"Effective batch size: {_micro} x {_acc} x {self.world_size} = {_micro * _acc * self.world_size}"
+                    f"  (micro x grad_accum x ranks)")
 
         # Helper to move BatchedDatapoint to device
         def move_to_device(obj, device):

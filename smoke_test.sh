@@ -32,6 +32,15 @@ TIMEOUT=900                               # hard cap (s) in case it hangs
 # the count so the effective batch stays what the real queue uses.
 DEVICES="${BM_DEVICES:-0}"
 N_GPU=$(echo ${DEVICES} | wc -w)
+# A1.28 item 157(c): at 4 ranks N_TRAIN=8 leaves only ~13 micro-steps per
+# rank, so the s/it that the WHOLE rental is extrapolated from would be
+# dominated by warmup and cudnn.benchmark autotune. Widen the smoke fold
+# when it would otherwise be too short to measure. 1x/2x keep 8 exactly,
+# so the A1.27 gate does not move. The extrapolation normalises by
+# N_TRAIN (tiles_per_img below), so a wider smoke fold does not bias the
+# hours estimate - it only makes the rate less noisy.
+if (( N_GPU >= 4 )); then N_TRAIN=$(( 4 * N_GPU )); fi
+N_TRAIN="${BM_SMOKE_TRAIN:-$N_TRAIN}"
 # ========================================================
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }

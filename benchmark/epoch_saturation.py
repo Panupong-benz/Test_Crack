@@ -497,6 +497,21 @@ def selftest():
         assert int(b3["optimizer_steps"]) == int(b1["optimizer_steps"]), (
             "2-GPU accum 4 must equal 1-GPU accum 8 in optimizer steps", b3, b1)
         assert int(b3["world_size"]) == 2, b3
+        # A1.28 item 159: the 4-GPU twin (accum 8/4 = 2, world 4) - the
+        # division by (bs * world) must be generic, not a 2-special.
+        d4 = runs / "a6_F4_s0"
+        d4.mkdir(parents=True)
+        (d4 / "run.json").write_text(json.dumps(
+            {"epochs": 30, "batch": 2, "grad_accum": 2, "world_size": 4,
+             "n_train_tiles": 6000}))
+        write_stats(d4, [real])
+        collect(runs, res, root / "cfg", root / "queue_state.json", None)
+        bt4 = list(csv.DictReader(open(res / "budget_table.csv",
+                                       encoding="utf-8")))
+        b4 = next(b for b in bt4 if b["run"] == "a6_F4_s0")
+        assert int(b4["optimizer_steps"]) == int(b1["optimizer_steps"]), (
+            "4-GPU accum 2 must equal 1-GPU accum 8 in optimizer steps", b4, b1)
+        assert int(b4["world_size"]) == 4, b4
     # A1.22: an extended run appends epochs 31..60 to the same file - that is
     # a CONTINUATION (one block, restarts=0), not a restart, and the budget
     # comes from the rewritten run.json (epochs=60, resumed_from=[30])

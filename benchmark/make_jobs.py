@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 from pathlib import Path
 
 import yaml
@@ -36,7 +37,7 @@ ALL_ROWS = ["a1", "unet", "deeplabv3p", "segformer", "a5", "a6"]
 
 
 def override_keys(cfg: dict, data_dir: str, seed: int, out_dir: str,
-                  gpus: int = 1) -> dict:
+                  gpus: int = 1, num_workers: int | None = None) -> dict:
     """Recursively set data_dir / seed / output_dir wherever they occur —
     tolerant of the config's section layout (the base YAML nests them).
 
@@ -45,6 +46,15 @@ def override_keys(cfg: dict, data_dir: str, seed: int, out_dir: str,
     epoch stay exactly what the single-GPU run had. Refuses a non-integer
     split rather than silently changing the experiment."""
     cfg = copy.deepcopy(cfg)
+    if num_workers is not None:
+        # A1.28 item 157(d): throughput-only escape hatch. The DataLoader is
+        # built per rank, so num_workers=4 at world=4 is 16 worker processes,
+        # each holding image_cache_size full-res decoded photos and respawned
+        # every epoch (persistent_workers=False is mandatory, A1.22 item 120).
+        # That is host RAM/IO pressure, not VRAM, and it does NOT touch the
+        # model arithmetic. The value used lands in the generated YAML, which
+        # collect_results archives, so provenance survives.
+        cfg.setdefault("training", {})["num_workers"] = int(num_workers)
     if gpus > 1:
         tr = cfg.setdefault("training", {})
         acc = int(tr.get("gradient_accumulation_steps", 1))
@@ -71,6 +81,54 @@ def override_keys(cfg: dict, data_dir: str, seed: int, out_dir: str,
 
     walk(cfg)
     return cfg
+
+
+def check_gpu_count(gpus: int, torch_mod=None) -> None:
+    """A1.28 item 157(a): --gpus was never checked against the machine.
+
+    Typing --gpus 4 on a 2-GPU rental silently bakes "--device 0 1 2 3" into
+    jobs.yaml; the failure then surfaces inside the first paid multi-hour
+    training job, where it reads like a code bug. Same class as A1.11/A1.12/
+    A1.13, so it is checked at the earliest point it CAN be checked and the
+    message says which kind of fault it is.
+
+    torch_mod is the injection point for the selftest (no CUDA on the dev
+    box); production passes None and the import is attempted here.
+    """
+    if gpus < 1:
+        raise SystemExit("--gpus %d: must be >= 1" % gpus)
+    if gpus == 1:
+        return
+    if torch_mod is None:
+        try:
+            import torch as torch_mod  # noqa: PLC0415  (optional dependency)
+        except Exception:
+            print("  WARN: torch not importable, cannot verify that %d GPUs "
+                  "exist. Expected on the dev box; on the rental it means "
+                  "this interpreter has no torch (setup step E)." % gpus)
+            return
+    have = int(torch_mod.cuda.device_count())
+    if have == 0:
+        # No CUDA at all: the dev box, or a rental with a broken driver. The
+        # latter dies at torchrun in seconds - cheap and loud - which is not
+        # the multi-hour failure this guard is for.
+        print("  WARN: no CUDA device visible, cannot verify --gpus %d." % gpus)
+        return
+    if have < gpus and os.environ.get("BM_ALLOW_GPU_MISMATCH") == "1":
+        # Local gate only: proving the structure of a 4-GPU queue on a 1-GPU
+        # dev box. The runbook sequence never sets this.
+        print("  WARN: BM_ALLOW_GPU_MISMATCH=1 - emitting a %d-GPU queue on a "
+              "box with %d. Valid ONLY for offline structure checks." % (gpus, have))
+        return
+    if have < gpus:
+        raise SystemExit(
+            "ENVIRONMENT fault, NOT a code bug: --gpus %d was requested but "
+            "this box reports %d CUDA device(s). Check `nvidia-smi -L`. "
+            "Either rent the box you meant to, or pass --gpus %d. Left "
+            "unchecked this would have died inside the first paid training "
+            "job (A1.28 item 157(a))." % (gpus, have, have))
+    if have > gpus:
+        print("  note: %d GPUs visible, using %d" % (have, gpus))
 
 
 def main():
@@ -107,6 +165,13 @@ def main():
                          "queue; N>1 adds --device 0..N-1 (the trainer self-"
                          "launches torchrun) and divides grad accumulation by N "
                          "so the effective batch stays 16.")
+    ap.add_argument("--num-workers", type=int, default=None,
+                    help="DataLoader workers PER RANK for A6 (A1.28 item "
+                         "157(d)). Default None = the base config value (4). "
+                         "At --gpus 4 that is 16 worker processes; drop it if "
+                         "the smoke reports > 1.5 s/it (input-bound) or the "
+                         "box is short on cores/RAM. Throughput only: it does "
+                         "not change the model arithmetic.")
     ap.add_argument("--rows", nargs="+", default=ALL_ROWS,
                     choices=ALL_ROWS, metavar="ROW",
                     help="which benchmark rows to emit (default: all six). "
@@ -115,6 +180,7 @@ def main():
                          "not cancelled - a later rental adds them with the "
                          "same pool/folds and the eval CSVs merge in results/.")
     args = ap.parse_args()
+    check_gpu_count(args.gpus)          # A1.28 item 157(a), before any work
     rows = set(args.rows)
     seg_rows = [a for a in SEG_ARCHS if a in rows]
 
@@ -175,7 +241,9 @@ def main():
                         f"--config-dir {args.config_dir.as_posix()} "
                         f"--base-config {args.base_config.as_posix()} "
                         f"--data-root {args.data_root}"
-                        + (f" --gpus {args.gpus}" if args.gpus > 1 else ""))
+                        + (f" --gpus {args.gpus}" if args.gpus > 1 else "")
+                        + (f" --num-workers {args.num_workers}"
+                           if args.num_workers is not None else ""))
     # --device 0..N-1 only when N>1: a single-GPU queue must stay byte-
     # identical to every queue generated before A1.27.
     _dev = (" --device " + " ".join(str(i) for i in range(args.gpus))
@@ -198,7 +266,8 @@ def main():
                     after=after)
         else:
             cfg = override_keys(base_cfg, f"{args.data_root}/fold_{fold}",
-                                seed, f"runs/{tag}", gpus=args.gpus)
+                                seed, f"runs/{tag}", gpus=args.gpus,
+                                num_workers=args.num_workers)
             if args.a6_epochs:
                 # set AFTER override_keys - its key-name walk would clobber
                 # every num_epochs in the tree (A1.21 item 114)

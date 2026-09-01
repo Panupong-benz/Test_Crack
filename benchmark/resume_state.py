@@ -341,6 +341,35 @@ def _selftest() -> int:
         assert rng_for_rank(legacy, 0) is legacy["rng"]
         assert rng_for_rank(legacy, 1) is legacy["rng"], "flat file serves every rank"
         assert gather_rng_all(0, 1).keys() == {0}
+        # A1.28 item 159: 4 ranks round-trip, and a rank from a LARGER world
+        # than the file was written at is refused - so a 2-GPU ckpt carried
+        # into a 4-GPU run dies loudly on ranks 2/3 instead of silently
+        # sharing streams (item 158.4).
+        rs4 = {}
+        for k in range(4):
+            random.random(); np.random.rand(); torch.rand(1)
+            rs4[k] = capture_rng()
+        p4 = c / "per_rank4.pt"
+        save_state(p4, lora_sd={}, optimizer_sd={}, epoch_completed=1,
+                   best_val_loss=1.0, meta={}, rng_ranks=rs4)
+        st4 = load_state(p4)
+        assert sorted(st4["rng_ranks"]) == [0, 1, 2, 3]
+        for k in range(4):
+            assert rng_for_rank(st4, k)["torch_cpu"].tolist() == rs4[k]["torch_cpu"].tolist()
+        assert len({tuple(rs4[k]["torch_cpu"].tolist()) for k in range(4)}) == 4, \
+            "4 ranks must carry 4 distinct streams"
+        try:
+            rng_for_rank(st4, 4)
+            raise AssertionError("rank 4 against a 4-rank file was accepted")
+        except SystemExit:
+            pass
+        try:
+            rng_for_rank(st2, 3)          # the 2-rank file, asked by rank 3
+            raise AssertionError("2-rank ckpt served rank 3 - the 2->4 migration would be silent")
+        except SystemExit:
+            pass
+        print("  per-rank RNG at world 4: round-trip, 4 distinct streams, rank 4 refused;"
+              " 2-rank file refuses rank 3 (2->4 migration dies loudly)")
         print("  per-rank RNG: {0,1} round-trip, rank 0 == flat rng, unknown rank refused,"
               " legacy flat file restores on any rank")
 
