@@ -64,7 +64,13 @@ def build_cmd(img: Path, args) -> list:
            "--config", str(args.config),
            "--image", str(img),
            "--prompt", args.prompt,
-           "--output", str(args.out / img.stem),
+           # A1.26: the ".png" is load-bearing, not cosmetic. Roboflow names
+           # carry dots (IMG_4100_JPG_JPG.rf.<hash>.jpg), so infer_sam's
+           # os.path.splitext(args.output) reads the hash as the extension:
+           # plt.savefig() then dies with an unsupported format AFTER the
+           # whole image has been inferred, and the mask would have landed
+           # at "<name>.rf_mask.png" instead of "<stem>_mask.png".
+           "--output", str(args.out / (img.stem + ".png")),
            "--threshold", str(args.threshold),
            "--sliding-window",
            "--tile-size", str(args.tile_size),
@@ -133,8 +139,11 @@ def main():
               f"(elapsed {int(_el) // 60}m{int(_el) % 60:02d}s, "
               f"ETA {int(_eta) // 60}m{int(_eta) % 60:02d}s)", flush=True)
         if r.returncode != 0:
-            failures.append({"image": img.name,
-                             "tail": (r.stderr or r.stdout)[-400:]})
+            tail = (r.stderr or r.stdout)[-400:]
+            failures.append({"image": img.name, "tail": tail})
+            # a5_run.json is not in the queue log, and the queue log is
+            # all anyone reads on a rented box
+            print(f"       {tail.strip()}", flush=True)
         elif not (args.out / f"{img.stem}_mask.png").exists():
             # exit 0 with no mask means --save-mask silently stopped working;
             # eval would score an empty prediction and never complain
@@ -175,12 +184,25 @@ def selftest() -> int:
         assert cmd[cmd.index("--config") + 1].endswith("full_lora_config.yaml")
         # A1.4: without --save-mask infer_sam writes only its overlay figure
         assert "--save-mask" in cmd, f"{name}: --save-mask missing"
+        out = cmd[cmd.index("--output") + 1]
+        # A1.26: infer_sam splits the extension off --output for BOTH the
+        # overlay figure and the "<base>_mask.png" it writes. A dotted
+        # Roboflow name with no extension breaks both.
+        assert out.endswith(".png"), f"{name}: --output needs .png, got {out}"
         assert "--no-progress" in cmd and "--sliding-window" in cmd
         assert cmd[cmd.index("--threshold") + 1] == "0.3"
 
     assert "--no-lora" in a5 and "--weights" not in a5, a5
     assert "--weights" in a6 and "--no-lora" not in a6, a6
     assert a6[a6.index("--weights") + 1] == "best.pt"
+
+    import os as _os
+    dotted = Path("IMG_4100_JPG_JPG.rf.dadc3afacbaac24cafbceb75c1b783c6.jpg")
+    dcmd = build_cmd(dotted, types.SimpleNamespace(**base))
+    dout = dcmd[dcmd.index("--output") + 1]
+    dbase, dext = _os.path.splitext(dout)
+    assert dext == ".png", dext
+    assert Path(dbase + "_mask.png").name == dotted.stem + "_mask.png", dbase
 
     extra = build_cmd(img, types.SimpleNamespace(**{**base,
                                                    "extra": "--tta --seed 1"}))
@@ -189,7 +211,8 @@ def selftest() -> int:
     print("run_a5_zeroshot selftest PASS: --config always passed; A5 asks for "
           "--no-lora and never --weights (so infer_sam cannot auto-detect the "
           "smoke checkpoint); A6 passes --weights and never --no-lora; "
-          "--save-mask kept on both")
+          "--save-mask kept on both; --output always ends .png so a dotted "
+          "Roboflow name still yields <stem>_mask.png")
     return 0
 
 
