@@ -60,6 +60,24 @@ if _BENCH_DIR.exists() and str(_BENCH_DIR) not in sys.path:
 import resume_state as _rs  # noqa: E402
 
 
+
+def _dataloader_worker_init(_worker_id: int) -> None:
+    """A1.30 item 166(c): cap OpenCV at one thread per DataLoader worker.
+
+    Each forked/spawned worker otherwise opens a full cv2 thread pool on a
+    host already running the trainer and the sibling workers - pure CPU
+    oversubscription (nothing in the repo called cv2.setNumThreads before
+    this). Worker-side cv2 work (JPEG decode, CLAHE, resize) is per-tile
+    and small, so single-threaded per worker is the right shape.
+    Deliberately NO RNG seeding here: torch >= 2.x reseeds numpy per worker
+    itself (withdrawn A1.20 item 105).
+    """
+    try:
+        cv2.setNumThreads(0)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def _lora_state(model):
     """Same keys save_lora_weights() writes: <module>.lora_A / .lora_B."""
     from lora_layers import LoRALayer
@@ -1144,6 +1162,16 @@ class SAM3TrainerNative:
             _loader_kwargs["prefetch_factor"] = int(
                 self.config["training"].get("prefetch_factor", 2)
             )
+            # A1.30 item 166(b): default timeout=0 waits FOREVER on a
+            # blocked-but-alive worker (page thrash, blocked read, an
+            # inherited lock) - on a rented box that is an invisible stall
+            # billed by the hour. 600 s is ~10x the worst measured dense-
+            # tile __getitem__; hitting it raises with a traceback naming
+            # the worker instead. A KILLED worker already raises (~5 s
+            # liveness poll) regardless of this value.
+            _loader_kwargs["timeout"] = 600
+            # A1.30 item 166(c)
+            _loader_kwargs["worker_init_fn"] = _dataloader_worker_init
 
         train_loader = DataLoader(
             train_ds,
@@ -1347,6 +1375,7 @@ class SAM3TrainerNative:
             grad_accum_steps = self.config["training"].get("gradient_accumulation_steps", 1)
             self.optimizer.zero_grad()
 
+            _t_step = time.time()   # A1.30 item 166(a)
             for step, batch_dict in enumerate(pbar):
                 input_batch = batch_dict["input"]
                 if step == 0:
@@ -1408,7 +1437,15 @@ class SAM3TrainerNative:
 
                 # Track training loss
                 train_losses.append(total_loss.item() * grad_accum_steps)
-                pbar.set_postfix({"loss": total_loss.item() * grad_accum_steps})
+                # A1.30 item 166(a): s_step = dataloader wait + compute for
+                # THIS step. The bar redraws once per step, so a bar that
+                # sits frozen shows the last completed step's duration and
+                # the log becomes a per-step timeline - the one signal the
+                # "81% stall" rental did not have.
+                _now = time.time()
+                pbar.set_postfix({"loss": total_loss.item() * grad_accum_steps,
+                                  "s_step": round(_now - _t_step, 2)})
+                _t_step = _now
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0

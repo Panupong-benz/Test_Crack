@@ -162,43 +162,49 @@ if [[ $have_smi -eq 1 ]]; then
   fi
 fi
 
-# rough full-run extrapolation
-if [[ -n "${its:-}" && -n "${steps:-}" ]]; then
-  python3 - "$its" "$steps" "$N_TRAIN" "$SRC_FOLD" "$FULL_CONFIG" "$N_GPU" <<'PY'
-import sys, json, os, yaml
-its=float(sys.argv[1]); smoke_steps=int(sys.argv[2].split('/')[-1])
-ntr=int(sys.argv[3]); src=sys.argv[4]; full=sys.argv[5]; ngpu=int(sys.argv[6])
-# A1.27: the bar counts rank-0 steps = tiles/(bs*ngpu); scale back to tiles
-smoke_steps *= ngpu
-cfg=yaml.safe_load(open(full)); t=cfg.get("training",{})
-bs=t.get("batch_size",2); epochs=t.get("num_epochs",30)
-real=len(json.load(open(os.path.join(src,"train","_annotations.coco.json")))["images"])
-tiles_per_img = smoke_steps*bs/max(ntr,1)
-real_steps = tiles_per_img*real/bs
-sec = real_steps*epochs/max(its,1e-6)
-real_steps /= ngpu   # per-rank steps at the measured per-rank it/s
-sec = real_steps*epochs/max(its,1e-6)
-print(f"[extrapolate] ~{tiles_per_img:.1f} tiles/img -> ~{real_steps:.0f} steps/epoch/GPU x {epochs} ep on {ngpu} GPU")
-print(f"[extrapolate] this fold (~{real} imgs): ~{sec/60:.0f} min  (~{sec/3600:.1f} h)  at {its} it/s")
-# "roughly double" was written for the July 2-fold set and understates a
-# 4-fold LOWO run by ~2x - the number the operator reads before committing
-# to the rental. Scale by the train sizes actually on disk (A1.18).
-import glob
-tot = 0
-folds = []
-for j in sorted(glob.glob(os.path.join(os.path.dirname(src) or ".", "fold_*",
-                                       "train", "_annotations.coco.json"))):
-    n = len(json.load(open(j))["images"])
-    folds.append((os.path.basename(os.path.dirname(os.path.dirname(j))), n))
-    tot += n
-if tot:
-    all_h = sec / 3600 * tot / max(real, 1)
-    print("[extrapolate] folds on disk: "
-          + ", ".join(f"{k}={n}" for k, n in folds))
-    print(f"[extrapolate] ALL {len(folds)} folds (train imgs {tot}): "
-          f"~{all_h:.1f} h of a6 training  (+ a5/predict/eval ~1-2 h)")
-else:
-    print("[extrapolate] WARNING: no sibling fold_*/ found - cannot total the run")
+# exact full-run projection (A1.30 item 167): the GPU measures s/it, the
+# step counts are COUNTED by the production TiledCOCODataset over each
+# fold's COCO json - never extrapolated from the smoke sample again. The
+# old tiles-per-image scaling under-read fold_RW20 by 2x because POOL_BM
+# mixes 6-tile resized frames with 35-tile full-res frames, and whichever
+# 8 images the smoke drew decided the whole rental's estimate.
+if [[ -n "${its:-}" ]]; then
+  python3 - "$its" "$SRC_FOLD" "$FULL_CONFIG" "$N_GPU" <<'PY'
+import sys
+from pathlib import Path
+its = float(sys.argv[1]); src = Path(sys.argv[2])
+full = Path(sys.argv[3]); ngpu = int(sys.argv[4])
+sys.path.insert(0, "benchmark")
+import count_tiles as ct                                   # noqa: E402
+tcfg = ct.tiling_cfg(full)
+batch, epochs = ct.cfg_batch_epochs(full)
+s_it = 1.0 / max(its, 1e-6)
+root = src.parent if src.parent != Path(".") else Path(".")
+total_h, rows = 0.0, []
+for fold in sorted(root.glob("fold_*")):
+    if not (fold / "train" / "_annotations.coco.json").exists():
+        continue
+    try:
+        ds = ct.build(fold, tcfg)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[extrapolate] WARN {fold.name}: {e}")
+        continue
+    tiles = len(ds.tile_specs)
+    spr = ct.steps_per_rank(tiles, batch, ngpu)
+    h = spr * epochs * s_it / 3600.0
+    total_h += h
+    rows.append((fold.name, tiles, spr, h))
+if not rows:
+    print("[extrapolate] WARNING: no fold_*/ with a COCO found - cannot "
+          "project the run")
+for name, tiles, spr, h in rows:
+    print(f"[extrapolate] {name}: {tiles} tiles -> {spr} steps/epoch/GPU "
+          f"x {epochs} ep on {ngpu} GPU -> ~{h:.1f} h  (COUNTED, not "
+          f"extrapolated - A1.30)")
+if rows:
+    print(f"[extrapolate] ALL {len(rows)} folds: ~{total_h:.1f} h of a6 "
+          f"training at {s_it:.2f} s/it  (+ a5/predict/eval ~1-2 h; "
+          f"train only the folds you queue)")
 PY
 fi
 say "==============================================="

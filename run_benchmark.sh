@@ -39,7 +39,10 @@ fi
 # resource_log.csv. Pidfile-guarded, exits on its own after QUEUE_DONE; on the
 # full run poweroff kills it, which is fine - the report is a queue job.
 start_monitor() {
-  nohup python3 benchmark/resource_monitor.py --daemon       >> runs/resource_monitor.log 2>&1 &
+  # A1.30 item 166(d): 60 s was too coarse to see a minutes-long stall;
+  # at 15 s a 3-minute dense-tile block leaves ~12 samples, enough to
+  # read util+power+swap and tell H1 (data wait) from H2 (RAM thrash).
+  nohup python3 benchmark/resource_monitor.py --daemon --interval 15       >> runs/resource_monitor.log 2>&1 &
   local pid=$!
   # $! is set even when the command does not exist, so the old message
   # reported a dead process as started - which is exactly what happened

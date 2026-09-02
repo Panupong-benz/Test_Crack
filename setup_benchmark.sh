@@ -314,6 +314,18 @@ complete. Re-run setup_v2.sh and read its pip output."
 # A1.24 item 135: load_lora_weights used to discard the strict=False result,
 # so a key-name mismatch loaded NOTHING in silence and row A6 became row A5.
 python3 benchmark/check_lora_load.py || die "LoRA-load guard FAILED"
+# A1.30 items 165/168: exact tile counting + windowed polygon decode.
+python3 benchmark/count_tiles.py --selftest || die "count_tiles selftest FAILED"
+python3 benchmark/check_tile_equivalence.py --selftest-window   || die "window-decode selftest FAILED"
+# The REAL equivalence gate on this box's data: windowed decode (default)
+# vs TILE_DATASET_FULLFRAME_DECODE=1, densest tiles always included. A few
+# minutes of CPU. A FAIL means the mask pixels would differ from every
+# previous rental - do NOT train through it silently.
+python3 benchmark/check_tile_equivalence.py --mode window --data data/fold_RW20 -n 30   || die "windowed-decode equivalence FAILED on real data (A1.30 item 168).
+Escape hatch (money-safe, one line):
+    echo 'export TILE_DATASET_FULLFRAME_DECODE=1' >> /workspace/.bm_env
+then re-run this script - the queue trains on the pre-A1.30 decode path.
+Also report the failure: the fix belongs in the repo, not on this box."
 
 echo -e "\nsetup_benchmark complete. Next - INTERIM SCOPE (A6 seed 0 + A5, Amendment A1.8):"
 echo "  1. bash run_benchmark.sh smoke-a6     # ~25 min: pipe, resume, INFER path, s/step"

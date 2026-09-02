@@ -192,6 +192,83 @@ class TiledCOCODataset(Dataset):
             return mask_utils.decode(mask_utils.merge(rles)).astype(np.uint8)
         return np.zeros((h, w), dtype=np.uint8)
 
+    def _decode_ann_mask_tile(self, ann: dict, h: int, w: int,
+                              x0: int, y0: int) -> np.ndarray:
+        """Tile-window view (ts x ts) of one annotation's mask.
+
+        Equivalent to _decode_ann_mask(ann, h, w) followed by
+        _crop_or_pad(..., x0, y0, fill=0) - pinned byte-identical by
+        benchmark/check_tile_equivalence.py --window (A1.30 item 168);
+        TILE_DATASET_FULLFRAME_DECODE=1 restores the old path.
+
+        Why it is exact: rleFrPoly scales coords x5 and rounds, so an
+        INTEGER canvas shift moves the scaled coords by an integer and
+        rounding is unchanged; and the canvas covers the polygon's own
+        bbox (+1 px margin, clipped to the frame), so no vertex is
+        clamped - clamping is the one thing that could change the fill
+        (at the real frame edge both paths clamp identically). Cost per
+        annotation drops from O(frame) - 18 MP on the full-res walls -
+        to O(annotation bbox).
+        """
+        ts = self.tile_size
+        seg = ann.get("segmentation")
+        out = np.zeros((ts, ts), dtype=np.uint8)
+        if not isinstance(seg, list) or not seg:
+            # RLE dict / missing: full-frame as before (RLE has no window)
+            full = self._decode_ann_mask(ann, h, w)
+            return self._crop_or_pad(full, x0, y0, fill=0)
+
+        mnx = min(min(p[0::2]) for p in seg if len(p) >= 2)
+        mxx = max(max(p[0::2]) for p in seg if len(p) >= 2)
+        mny = min(min(p[1::2]) for p in seg if len(p) >= 2)
+        mxy = max(max(p[1::2]) for p in seg if len(p) >= 2)
+        cx0 = max(0, int(np.floor(mnx)) - 1)
+        cy0 = max(0, int(np.floor(mny)) - 1)
+        cx1 = min(w, int(np.ceil(mxx)) + 2)
+        cy1 = min(h, int(np.ceil(mxy)) + 2)
+        cw, ch = cx1 - cx0, cy1 - cy0
+        if cw <= 0 or ch <= 0:
+            return out
+        # canvas vs tile window intersection (empty -> all-zero tile mask,
+        # same as the ys.size == 0 discard downstream)
+        if cx1 <= x0 or cx0 >= x0 + ts or cy1 <= y0 or cy0 >= y0 + ts:
+            return out
+
+        shifted = []
+        for p in seg:
+            q = np.asarray(p, dtype=np.float64)
+            # Quantize to maskApi's own 1/5-px grid in FULL-FRAME coords
+            # FIRST, then shift. rleFrPoly computes int(5*v + .5), and float
+            # multiplication rounds differently at frame magnitude than at
+            # canvas magnitude (295.9 -> 1479 full-frame but 1480 after a
+            # raw shift), so shifting the raw coords breaks byte-equality on
+            # fractional coordinates. np.trunc matches the C (int) cast for
+            # both signs; dividing the shifted grid value by 5 re-quantizes
+            # to the same integer inside frPyObjects (error ~1e-13 << 0.5).
+            q5 = np.trunc(5.0 * q + 0.5)
+            q5[0::2] -= 5.0 * cx0
+            q5[1::2] -= 5.0 * cy0
+            # int(5v+.5) truncates toward ZERO, so its inverse is sign-
+            # dependent: n >= 0 needs 5v+.5 in [n, n+1) -> v = n/5, while
+            # n < 0 needs (n-1, n] -> v = (n-1)/5 (out-of-frame vertices
+            # stay negative here; maskApi walks the full edge and only
+            # skips out-of-canvas columns, so these values still set the
+            # slope). Both choices sit 0.5 from the interval edge - float
+            # error ~1e-13 cannot flip them.
+            v5 = np.where(q5 >= 0.0, q5, q5 - 1.0) / 5.0
+            shifted.append(v5.tolist())
+        rles = mask_utils.frPyObjects(shifted, ch, cw)
+        m = mask_utils.decode(mask_utils.merge(rles)).astype(np.uint8)
+
+        tx0, ty0 = cx0 - x0, cy0 - y0            # canvas origin in tile coords
+        sx0, sy0 = max(0, -tx0), max(0, -ty0)    # source offset in canvas
+        dx0, dy0 = max(0, tx0), max(0, ty0)      # dest offset in tile
+        wd = min(cw - sx0, ts - dx0)
+        hd = min(ch - sy0, ts - dy0)
+        if wd > 0 and hd > 0:
+            out[dy0:dy0 + hd, dx0:dx0 + wd] = m[sy0:sy0 + hd, sx0:sx0 + wd]
+        return out
+
     def _build_tile_index(self) -> List[Tuple[int, int, int]]:
         specs: List[Tuple[int, int, int]] = []
         self.tile_crack_pixels: List[int] = []
@@ -457,8 +534,13 @@ class TiledCOCODataset(Dataset):
             # Equivalence pinned by benchmark/check_tile_equivalence.py.
             if not self._bbox_hits_tile(ann, x0, y0):
                 continue
-            full_mask = self._decode_ann_mask(ann, orig_h, orig_w)
-            tile_mask = self._crop_or_pad(full_mask, x0, y0, fill=0)
+            if os.environ.get("TILE_DATASET_FULLFRAME_DECODE"):
+                # A1.30 item 168 escape hatch: the pre-windowing path
+                full_mask = self._decode_ann_mask(ann, orig_h, orig_w)
+                tile_mask = self._crop_or_pad(full_mask, x0, y0, fill=0)
+            else:
+                tile_mask = self._decode_ann_mask_tile(ann, orig_h, orig_w,
+                                                       x0, y0)
 
             if flip_h:
                 tile_mask = np.ascontiguousarray(tile_mask[:, ::-1])

@@ -53,7 +53,11 @@ GB = 1024 ** 3
 FIELDS = ["ts", "disk_used_gb", "disk_free_gb",
           "vram_used_mb", "vram_total_mb", "gpu_util_pct", "power_w",
           "ram_used_gb", "ram_total_gb", "running_job",
-          "runs_gb", "hf_cache_gb", "pool_gb", "n_gpu"]
+          "runs_gb", "hf_cache_gb", "pool_gb", "n_gpu",
+          # A1.30 item 166(d), appended LAST so old CSVs stay readable:
+          # swap movement is what separates "waiting for data" (H1) from
+          # "RAM exhausted -> thrash" (H2) outright.
+          "swap_used_gb"]
 
 
 # ----------------------------------------------------------------- readers -
@@ -104,7 +108,8 @@ def aggregate_gpu_lines(text: str):
 
 
 def read_ram():
-    """(used_gb, total_gb) from /proc/meminfo; blanks off-Linux."""
+    """(used_gb, total_gb, swap_used_gb) from /proc/meminfo; blanks
+    off-Linux."""
     try:
         info = {}
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -112,9 +117,11 @@ def read_ram():
             info[k] = int(v.strip().split()[0])              # kB
         total = info["MemTotal"] / 1024 / 1024
         avail = info.get("MemAvailable", info.get("MemFree", 0)) / 1024 / 1024
-        return round(total - avail, 2), round(total, 2)
+        swap_u = (info.get("SwapTotal", 0) - info.get("SwapFree", 0)) \
+            / 1024 / 1024
+        return round(total - avail, 2), round(total, 2), round(swap_u, 2)
     except Exception:                                        # noqa: BLE001
-        return "", ""
+        return "", "", ""
 
 
 def read_running(queue_state: Path):
@@ -142,14 +149,15 @@ def du_gb(path: Path):
 def sample(watch: Path, queue_state: Path, with_du: bool, du_paths: dict):
     used, free = read_disk(watch)
     vram_u, vram_t, util, power, n_gpu = read_gpu()
-    ram_u, ram_t = read_ram()
+    ram_u, ram_t, swap_u = read_ram()
     row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "disk_used_gb": used, "disk_free_gb": free,
            "vram_used_mb": vram_u, "vram_total_mb": vram_t,
            "gpu_util_pct": util, "power_w": power,
            "ram_used_gb": ram_u, "ram_total_gb": ram_t,
            "running_job": read_running(queue_state),
-           "runs_gb": "", "hf_cache_gb": "", "pool_gb": "", "n_gpu": n_gpu}
+           "runs_gb": "", "hf_cache_gb": "", "pool_gb": "", "n_gpu": n_gpu,
+           "swap_used_gb": swap_u}
     if with_du:
         row["runs_gb"] = du_gb(du_paths.get("runs"))
         row["hf_cache_gb"] = du_gb(du_paths.get("hf"))
