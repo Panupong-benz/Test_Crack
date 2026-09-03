@@ -281,6 +281,15 @@ python3 benchmark/check_module_scope.py || die "module-scope guard FAILED - the
 file named above raises NameError the moment Python imports it. Fix it in the
 repo and git pull; do NOT patch it on the instance (collect_results records the
 git SHA as the provenance of this run)."
+# Same class, different file: infer_sam.py also imports sam3 at module
+# scope, and its sliding-window mask paste had never met an image with
+# one side below tile_size - the first one stopped a paid queue AFTER
+# 16.34 h of training (Amendment A1.32). This runs the shipped block
+# through ast+exec with planted canvases, no torch, ~0.2 s.
+python3 benchmark/check_infer_paste.py --selftest || die "infer paste guard
+FAILED - predict_sliding_window would crash on any image with exactly one
+side smaller than tile_size. Fix it in the repo and git pull; do NOT patch
+it on the instance."
 python3 benchmark/eval_masks.py --selftest || die "eval_masks selftest FAILED"
 # to_nnunet runs only in the LAST block of the queue (row A1), so a bad
 # dataset.json or label range would surface after every training hour was

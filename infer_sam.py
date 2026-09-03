@@ -706,11 +706,22 @@ class SAM3LoRAInference:
                 if r.get("masks") is not None:
                     tile_masks = r["masks"]  # (N, tile_h, tile_w) bool
                     any_tile = tile_masks.any(axis=0)
-                    # Guard against rare shape mismatches
-                    th, tw = any_tile.shape
-                    merged[q_idx]["mask_union"][
-                        yo:yo + th, xo:xo + tw
-                    ] |= any_tile
+                    # A1.32: clip to the CANVAS, not to the tile. PIL's
+                    # crop() pads past the image edge, so a window that
+                    # runs off the canvas returns a full tile_size mask
+                    # while the destination slice is short - broadcast
+                    # error on any image with exactly one side < tile_size
+                    # (both sides short takes the single-image fallback).
+                    # The padded rows/cols are not part of the image, so
+                    # dropping them is the correct answer, not a patch.
+                    # For a window fully inside the canvas both min()s are
+                    # no-ops and the result is bit-identical to before.
+                    th = min(any_tile.shape[0], H - yo)
+                    tw = min(any_tile.shape[1], W - xo)
+                    if th > 0 and tw > 0:
+                        merged[q_idx]["mask_union"][
+                            yo:yo + th, xo:xo + tw
+                        ] |= any_tile[:th, :tw]
 
             # Memory hygiene — prevents VRAM creep across many tiles
             if torch.cuda.is_available():
