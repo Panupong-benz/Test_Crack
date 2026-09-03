@@ -1026,6 +1026,48 @@ class SAM3TrainerNative:
             normalize_by_valid_object_num=False,
         )
         
+    def _main_core_loss(self, loss_dict):
+        """A1.34: the core loss of the MAIN output alone, as a tensor.
+
+        WHY THIS EXISTS. Sam3LossWrapper sums core_loss over every output
+        present (sam3_loss.py:88-100), and the auxiliary-decoder and
+        one-to-many heads are gated on self.training (sam3_image.py:343-386;
+        decoder.py:449-456 duplicates the query set). A training epoch
+        therefore sums 26 terms against validation's 3, so `train_loss` and
+        `val_loss` are different functions of the model and must never be
+        plotted on one axis or differenced into a generalization gap.
+
+        The comparable quantity was already being computed and thrown away.
+        The wrapper stores the main output's terms with an EMPTY suffix
+        (sam3_loss.py:136) - aux terms get `_aux_<i>`, one-to-many terms a
+        trailing `_o2m` - and pops the per-output core value before storing
+        (sam3_loss.py:135), so no per-output aggregate survives. Re-reducing
+        just the un-suffixed keys with each loss fn's own weight_dict - the
+        same reduction as LossWithWeights.reduce_loss, loss_fns.py:256-264 -
+        reproduces EXACTLY what core_loss equals under model.eval(), where
+        output_list collapses to the main entry alone. The validation loop
+        asserts that identity every epoch, so this expression cannot rot.
+
+        Weights are read off the live loss-fn objects, never re-typed here;
+        they are declared once where the loss fns are built.
+
+        Residual caveat for whoever plots it: this is still computed under
+        model.train(), so dropout, augmentation and DAC's duplicated query
+        set are active. That is what a training-loss curve means in every
+        paper - it is not a defect, and the distance to val_loss is now a
+        generalization gap that can be read as one.
+        """
+        total = None
+        for fn in self.loss_wrapper.loss_fns_find:
+            for k, w in getattr(fn, "weight_dict", {}).items():
+                if w == 0 or k not in loss_dict:
+                    continue
+                v = loss_dict[k]
+                v = v.detach() if torch.is_tensor(v) else torch.as_tensor(
+                    float(v), device=self.device)
+                total = v * w if total is None else total + v * w
+        return total
+
     def train(self):
         # Seeding lives in __init__ since A1.22 item 119: it used to sit HERE,
         # after __init__ had already run apply_lora_to_model(), so LoRA's
@@ -1366,6 +1408,7 @@ class SAM3TrainerNative:
 
             # Track training losses for this epoch
             train_losses = []
+            main_losses = []      # A1.34: validation-comparable component
             _fp_epoch = None   # A1.22: exact identity of this epoch's first batch
 
             # Only show progress bar on rank 0
@@ -1416,6 +1459,7 @@ class SAM3TrainerNative:
                     # Compute loss
                     loss_dict = self.loss_wrapper(outputs_list, find_targets)
                     total_loss = loss_dict[CORE_LOSS_KEY] / grad_accum_steps
+                    _main_core = self._main_core_loss(loss_dict)
 
                 # Backward — สะสม gradient โดยไม่ zero_grad
                 total_loss.backward()
@@ -1437,6 +1481,10 @@ class SAM3TrainerNative:
 
                 # Track training loss
                 train_losses.append(total_loss.item() * grad_accum_steps)
+                # kept as a tensor so the epoch costs ONE extra GPU sync,
+                # not one per step (7 .item() calls per step is measurable)
+                if _main_core is not None:
+                    main_losses.append(_main_core.float())
                 # A1.30 item 166(a): s_step = dataloader wait + compute for
                 # THIS step. The bar redraws once per step, so a bar that
                 # sits frozen shows the last completed step's duration and
@@ -1449,11 +1497,14 @@ class SAM3TrainerNative:
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
+            avg_train_main = (torch.stack(main_losses).mean().item()
+                              if main_losses else None)
 
             # Validation (only compute loss - no metrics, like SAM3)
             if has_validation and val_loader is not None:
                 self.model.eval()
                 val_losses = []
+                val_main_losses = []      # A1.34 identity check
 
                 with torch.no_grad():
                     val_pbar = tqdm(val_loader, desc=f"Validation", disable=not is_main_process())
@@ -1489,11 +1540,33 @@ class SAM3TrainerNative:
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
                         total_loss = loss_dict[CORE_LOSS_KEY]
+                        _vm = self._main_core_loss(loss_dict)
+                        if _vm is not None:
+                            val_main_losses.append(_vm.float())
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
 
                 avg_val_loss = sum(val_losses) / len(val_losses)
+
+                # A1.34 self-check, run BEFORE the all_reduce so both sides
+                # are this rank's own mean. Under eval() output_list holds
+                # the main entry alone, so the recomputed main-only core
+                # loss must reproduce core_loss. If it ever does not, then
+                # train_loss_main is NOT comparable to val_loss and nothing
+                # may plot them together - fail loudly rather than emit a
+                # column that silently means something else.
+                if val_main_losses:
+                    _vm_mean = torch.stack(val_main_losses).mean().item()
+                    _tol = 1e-4 * max(1.0, abs(avg_val_loss))
+                    if abs(_vm_mean - avg_val_loss) > _tol:
+                        raise RuntimeError(
+                            "A1.34: main-only core loss "
+                            f"{_vm_mean:.6f} != val core_loss "
+                            f"{avg_val_loss:.6f} under model.eval(). The "
+                            "loss-key convention assumed by _main_core_loss "
+                            "no longer holds; train_loss_main must not be "
+                            "compared with val_loss until this is fixed.")
 
                 # Synchronize val_loss across all processes for consistent best model selection
                 if self.multi_gpu:
@@ -1501,7 +1574,9 @@ class SAM3TrainerNative:
                     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                     avg_val_loss = val_loss_tensor.item()
 
-                print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+                _main_txt = ("" if avg_train_main is None
+                             else f" (main {avg_train_main:.6f})")
+                print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}{_main_txt}, Val Loss: {avg_val_loss:.6f}")
 
                 # Save models based on validation loss (only on rank 0)
                 if is_main_process():
@@ -1519,6 +1594,11 @@ class SAM3TrainerNative:
                         f.write(json.dumps({
                             "epoch": epoch + 1,
                             "train_loss": avg_train_loss,
+                            # A1.34: the only column comparable with
+                            # val_loss. epoch_saturation.py MUST keep
+                            # reading val_loss - the frozen A1.7 criterion
+                            # and every verdict already issued depend on it.
+                            "train_loss_main": avg_train_main,
                             "val_loss": avg_val_loss,
                             "fingerprint": _fp_epoch,
                         }) + "\n")

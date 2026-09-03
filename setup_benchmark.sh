@@ -304,6 +304,14 @@ python3 benchmark/check_images.py --selftest || die "check_images selftest FAILE
 # the trainer having NO LR scheduler - a shorter run must be a prefix of a
 # longer one. Milliseconds, no torch.
 python3 benchmark/check_prefix_property.py || die "prefix-property guard FAILED"
+# A1.34: the trainer logs train_loss_main, the only training number
+# comparable with val_loss (main-output core loss). The key convention
+# it relies on lives in sam3_loss.py; get it wrong and the column still
+# looks plausible while meaning something else. The trainer cannot be
+# imported on a dev box, so per 8bz it needs a static gate. No torch.
+python3 benchmark/check_main_core_loss.py || die "main-core-loss guard
+FAILED - train_loss_main would not be comparable with val_loss. Fix it
+in the repo and git pull; do NOT patch it on the instance."
 # A1.24 item 137: NO gate anywhere used to import sam3, yet every training and
 # every inference job does. A break in that chain therefore surfaced inside a
 # paid job as a bare ModuleNotFoundError. ~5 s (it pulls torch).
