@@ -58,6 +58,45 @@ CODE = ROOT / "code"
 CORRECTED = ROOT / "data" / "out_crop" / "corrected"
 RECT = ROOT / "data" / "out_crop" / "rectified"
 BM_ROOT = ROOT / "data" / "out_crop_bm"
+
+# --wall RW20C runs under pipeline_rerun_spec E3 (which pre-registered
+# RW20C/NSW6), NOT under the benchmark's axis C, which Amendment A1.2
+# item 18 froze to RW20 - cite E3, never A1.2, for this wall's numbers.
+#
+# RW20C differences, all verified 2026-09-04 before this was written:
+#  * masks are already FULL-frame (the pool holds RW20C uncropped, A1.35)
+#    in the EXIF-oriented space Stage A consumed -> --space full, no lift;
+#  * only 24 of 52 frames were lens-undistorted (lens column of the batch
+#    summary CSV). The rule "undistort iff that frame's coeffs exist" was
+#    proven equivalent by md5 of the exact file each _rectify.json names
+#    (24 == 24 == 24 across summary column / coeffs set / md5 class), but
+#    the SUMMARY column stays authoritative: a deleted coeffs file must be
+#    an error for a 15mm frame, never a silent skip;
+#  * no out_crop rect (the coeffs schema has none - full-frame warp).
+WALLS = {
+    "RW20": dict(corrected=CORRECTED, rect=RECT, lens_summary=None,
+                 meta=None),
+    "RW20C": dict(corrected=ROOT / "data" / "out_rw20c" / "barrel",
+                  rect=ROOT / "data" / "out_rw20c" / "rectified",
+                  lens_summary=ROOT / "data" / "out_rw20c" /
+                  "rw20c_rectification_summary.csv",
+                  meta=ROOT / "data" / "out_rw20c" /
+                  "meta_stageA_RW20C.csv"),
+}
+
+
+def lens_map(wall_cfg):
+    """core -> lens string from the Stage-A batch summary ('' / 'none' =
+    the frame ran raw). None when the wall has no summary (RW20: every
+    stored coeffs file applies)."""
+    lp = wall_cfg.get("lens_summary")
+    if not lp:
+        return None
+    out = {}
+    with open(lp, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            out[r["core"]] = (r.get("lens") or "").strip()
+    return out
 RESULTS = ROOT / "results" / "benchmark"
 SR_DATASET = ROOT / "results" / "SR" / "sr_dataset.csv"
 
@@ -81,31 +120,58 @@ def rb_from_zones(zw, xn=297.0, lw=900.0, hw=1800.0, hz=450.0):
 
 
 # ------------------------------------------------------------ front end ---
-def stored_params(core: str):
+def stored_params(core: str, wall_cfg=None, lenses=None):
     """coeffs.json (undistort params + crop rect) and _H.npz + canvas size
-    for one image core; None if the image never made it through Stage A."""
-    cj = glob.glob(str(CORRECTED / f"{core}_*coeffs.json"))
-    hp = RECT / f"{core}_H.npz"
-    rp = RECT / f"{core}_rect.png"
-    if not cj or not hp.exists() or not rp.exists():
+    for one image core; None if the image never made it through Stage A.
+
+    With a lens summary (RW20C), the summary column decides whether the
+    frame was undistorted: 'none'/'' -> raw (coeffs deliberately absent,
+    undistort skipped); a lens name -> the coeffs file is REQUIRED and its
+    absence is a hard error, never a silent raw fallback."""
+    cfg = wall_cfg or WALLS["RW20"]
+    corrected, rect = cfg["corrected"], cfg["rect"]
+    hp = rect / f"{core}_H.npz"
+    rp = rect / f"{core}_rect.png"
+    if not hp.exists() or not rp.exists():
         return None
-    meta = json.loads(Path(cj[0]).read_text(encoding="utf-8"))
+    cj = glob.glob(str(corrected / f"{core}_*coeffs.json"))
+    if lenses is None:                      # RW20: coeffs always required
+        if not cj:
+            return None
+        meta = json.loads(Path(cj[0]).read_text(encoding="utf-8"))
+        und = {"xc": meta["xcenter"], "yc": meta["ycenter"],
+               "coeffs": meta["coeffs_backward"],
+               "crop": meta.get("out_crop")}
+    else:
+        lens = lenses.get(core, "")
+        if lens in ("", "none"):
+            und = {"xc": None, "yc": None, "coeffs": None, "crop": None}
+        else:
+            if not cj:
+                raise RuntimeError(
+                    f"{core}: summary says lens={lens} but no coeffs.json "
+                    f"under {corrected} - refusing to warp a mask without "
+                    f"the undistort its frame received")
+            meta = json.loads(Path(cj[0]).read_text(encoding="utf-8"))
+            und = {"xc": meta["xcenter"], "yc": meta["ycenter"],
+                   "coeffs": meta["coeffs_backward"],
+                   "crop": meta.get("out_crop")}
     d = np.load(hp, allow_pickle=True)
     rect_shape = cv2.imread(str(rp), cv2.IMREAD_GRAYSCALE).shape
-    return {"xc": meta["xcenter"], "yc": meta["ycenter"],
-            "coeffs": meta["coeffs_backward"],
-            "crop": meta.get("out_crop"), "H": d["H"],
-            "canvas_wh": (rect_shape[1], rect_shape[0])}
+    return {**und, "H": d["H"], "canvas_wh": (rect_shape[1], rect_shape[0])}
 
 
 def mask_to_rect(mask: np.ndarray, p: dict) -> np.ndarray:
     """Full-frame mask -> rectified raster, replaying the stored transforms
     exactly as write_corrected + auto_rectify did (float undistort, >127
     binarize, stored crop rect, NEAREST perspective warp)."""
-    import discorpy.post.postprocessing as post
-    um = post.unwarp_image_backward(mask.astype(np.float32),
-                                    p["xc"], p["yc"], p["coeffs"])
-    um = (np.clip(um, 0, 255) > 127).astype(np.uint8) * 255
+    if p["coeffs"] is None:
+        um = (mask > 127).astype(np.uint8) * 255    # frame ran raw
+    else:
+        import discorpy.post.postprocessing as post
+        um = post.unwarp_image_backward(mask.astype(np.float32),
+                                        p["xc"], p["yc"], p["coeffs"])
+        um = (np.clip(um, 0, 255) > 127).astype(np.uint8) * 255
     if p["crop"]:
         cx, cy, cw, ch = p["crop"]
         um = um[cy:cy + ch, cx:cx + cw]
@@ -113,28 +179,65 @@ def mask_to_rect(mask: np.ndarray, p: dict) -> np.ndarray:
                                flags=cv2.INTER_NEAREST)
 
 
-def build_parallel_tree(pred_dir: Path, tag: str):
+def lift_crop_to_fullframe(pred_dir: Path, tag: str) -> Path:
+    """Benchmark masks are CROP-space, not full-frame. The pool's RW20
+    images are the hand-cropped frames at native resolution (verified
+    2026-09-03: all 108 test images match the crop manifest w/h exactly),
+    while the stored Stage-A transforms (xcenter/ycenter, out_crop) live in
+    the RAW full-frame space. Feeding a crop-space mask straight into
+    mask_to_rect() mis-crops silently wherever it does not crash.
+
+    The lift is production code, reused verbatim: data/rectified/
+    mask_to_full.py pastes each mask at its manifest (x, y) in the working
+    frame (rotating IMG_4162 back), refuses on any dims mismatch, and its
+    default --pattern already takes *_mask.png only."""
+    out = BM_ROOT / tag / "fullframe"
+    out.mkdir(parents=True, exist_ok=True)
+    m2f = ROOT / "data" / "rectified" / "mask_to_full.py"
+    # absolute paths: the subprocess runs with cwd = data/rectified (so
+    # mask_to_full's `from crop_map import ...` resolves), which silently
+    # re-bases any relative --masks
+    cmd = [sys.executable, str(m2f), "--masks", str(pred_dir.resolve()),
+           "-o", str(out.resolve())]
+    print("+ " + " ".join(cmd[1:]))
+    r = subprocess.run(cmd, cwd=str(m2f.parent))
+    if r.returncode != 0:
+        raise RuntimeError("mask_to_full failed - crop-space lift is "
+                           "required before the Stage-A replay")
+    return out
+
+
+def build_parallel_tree(pred_dir: Path, tag: str, wall: str = "RW20"):
     """Predicted masks -> parallel rectified tree. Returns (tree, coverage)."""
+    cfg = WALLS[wall]
+    lenses = lens_map(cfg)
+    rect = cfg["rect"]
     tree = BM_ROOT / tag / "rectified"
     tree.mkdir(parents=True, exist_ok=True)
     n_in = n_ok = 0
     for f in sorted(pred_dir.iterdir()):
-        if f.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+        # *_mask.png ONLY - infer_sam writes a matplotlib overlay as
+        # <stem>.png into the same dir (the decoy the eval_masks/A1.4-30 and
+        # render_overlays/A1.23-129 candidate orders exist for). This loop
+        # took it too: the overlay is a ~1183px figure canvas, so the stored
+        # full-res crop rect slices it empty and warpPerspective asserts.
+        # Third site of the same trap; found on the first real-mask run.
+        if not f.name.endswith("_mask.png"):
             continue
         core = core_of(f.name)
         if core is None:
             continue
         n_in += 1
-        p = stored_params(core)
+        p = stored_params(core, cfg, lenses)
         if p is None:
             continue                       # image never rectified in Stage A
         mask = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             continue
-        rect = mask_to_rect(mask, p)
-        cv2.imwrite(str(tree / f"{core}_rect_mask.png"), rect)
+        rm = mask_to_rect(mask, p)
+        cv2.imwrite(str(tree / f"{core}_rect_mask.png"), rm)
         for side in (f"{core}_H.npz", f"{core}_rectify.json"):
-            src = RECT / side
+            src = rect / side
             if src.exists():
                 shutil.copy2(src, tree / side)
         n_ok += 1
@@ -144,16 +247,32 @@ def build_parallel_tree(pred_dir: Path, tag: str):
 
 
 # ------------------------------------------------------------ chain part ---
-def run_chain(tree: Path, tag: str) -> Path:
+def run_chain(tree: Path, tag: str, wall: str = "RW20") -> Path:
     fused = tree.parent / "fused"
     mech_csv = tree.parent / "mechanics_chain.csv"
-    steps = [
-        [sys.executable, str(CODE / "fuse_canvas.py"),
-         "--rect", str(tree), "--out", str(fused)],
-        [sys.executable, str(CODE / "link_canvas.py"), "--fused", str(fused)],
-        [sys.executable, str(CODE / "run_mechanics_chain.py"),
-         "--fused", str(fused), "--out", str(mech_csv)],
-    ]
+    if wall == "RW20":
+        # byte-for-byte the pre---wall command lines: the RW20 identity
+        # gate depends on them not moving
+        steps = [
+            [sys.executable, str(CODE / "fuse_canvas.py"),
+             "--rect", str(tree), "--out", str(fused)],
+            [sys.executable, str(CODE / "link_canvas.py"),
+             "--fused", str(fused)],
+            [sys.executable, str(CODE / "run_mechanics_chain.py"),
+             "--fused", str(fused), "--out", str(mech_csv)],
+        ]
+    else:
+        cfg = WALLS[wall]
+        steps = [
+            [sys.executable, str(CODE / "fuse_canvas.py"), "--wall", wall,
+             "--meta", str(cfg["meta"]),
+             "--rect", str(tree), "--out", str(fused)],
+            [sys.executable, str(CODE / "link_canvas.py"), "--wall", wall,
+             "--fused", str(fused)],
+            [sys.executable, str(CODE / "run_mechanics_chain.py"),
+             "--wall", wall, "--source", "canvas",
+             "--fused", str(fused), "--out", str(mech_csv)],
+        ]
     for cmd in steps:
         print("+ " + " ".join(cmd[1:]))
         r = subprocess.run(cmd, cwd=str(ROOT))
@@ -179,18 +298,22 @@ def field_k():
     return num / den
 
 
-def score(mech_csv: Path, tag: str, out_csv: Path):
+def score(mech_csv: Path, tag: str, out_csv: Path, wall: str = "RW20"):
     """mechanics CSV -> x1 -> Rp errors under BOTH constants:
     - Rp_pred (K_FROZEN = 2.7902): the protocol's primary, never refit;
     - Rp_pred_fieldk (LS k on the field tier): the SS8u yardstick's own
       convention, so the 0.227 comparison stays apples-to-apples.
     Scoring basis = vision_case_study's (every step with |Rmea| >= 0.25);
-    x1 == 0 rows additionally carry status NO_RESIDUAL_SIGNAL (SS8aq)."""
+    x1 == 0 rows additionally carry status NO_RESIDUAL_SIGNAL (SS8aq).
+
+    The yardstick is the FIELD route on the same wall, computed here from
+    sr_dataset's x1_field on the same scored steps (for RW20 it must land
+    on the recorded 0.227 - asserted). E3 criterion: vision <= 1.10x it."""
     kf = field_k()
     field, rp_meas = {}, {}
     with open(SR_DATASET, encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            if r["wall"] != "RW20":
+            if r["wall"] != wall:
                 continue
             d = float(r["drift"])                 # already signed in sr_dataset
             if r.get("RB_r_keep_Xn297_pct") not in ("", "nan", None):
@@ -234,8 +357,17 @@ def score(mech_csv: Path, tag: str, out_csv: Path):
     mae_fk = sum(e_fk) / len(e_fk) if e_fk else float("nan")
     mae_fz = sum(e_fz) / len(e_fz) if e_fz else float("nan")
     n_nosig = sum(1 for r in rows if r["status"] == "NO_RESIDUAL_SIGNAL")
-    print(f"[axis C] {tag}: n={len(e_fk)} scored, MAE fieldk {mae_fk:.4f} "
-          f"(yardstick {YARDSTICK_MAE}) | frozen-k {mae_fz:.4f} | "
+    # field-route yardstick on the SAME wall and the SAME scored steps
+    ey = [abs(law(float(r["x1_field"]), K_FROZEN) - float(r["Rmea"]))
+          for r in rows
+          if r["abs_err"] != "" and r["x1_field"] != ""]
+    yard = sum(ey) / len(ey) if ey else float("nan")
+    if wall == "RW20":
+        assert abs(yard - YARDSTICK_MAE) < 1e-3,             f"RW20 field yardstick drifted: {yard:.4f} vs {YARDSTICK_MAE}"
+    ratio = mae_fz / yard if yard == yard and yard else float("nan")
+    print(f"[axis C] {tag} ({wall}): n={len(e_fz)} scored | frozen-k "
+          f"{mae_fz:.4f} vs field yardstick {yard:.4f} = {ratio:.3f}x "
+          f"(E3 bar 1.10x) | fieldk {mae_fk:.4f} | "
           f"no-signal steps {n_nosig} -> {out_csv}")
     return rows, mae_fk
 
@@ -311,19 +443,38 @@ def gate_chain():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gate", choices=["front", "chain"], default=None)
-    ap.add_argument("--pred", type=Path, help="model's full-frame masks")
+    ap.add_argument("--wall", choices=sorted(WALLS), default="RW20",
+                    help="RW20 = benchmark axis C (A1.2 item 18). RW20C "
+                         "runs under pipeline_rerun_spec E3 (pre-registered "
+                         "there); gates stay RW20-only")
+    ap.add_argument("--pred", type=Path,
+                    help="model's predicted masks (*_mask.png)")
     ap.add_argument("--tag", help="e.g. a6_RW20_s0")
+    ap.add_argument("--space", choices=["crop", "full"], default="crop",
+                    help="coordinate space of --pred masks. Benchmark masks "
+                         "are 'crop' (the pool's hand-cropped frames); "
+                         "'full' is for masks already lifted to the raw "
+                         "frame (preds_RW20_fullframe class). Wrong 'full' "
+                         "on crop-space input mis-crops silently - the "
+                         "default is therefore 'crop'.")
     args = ap.parse_args()
-    if args.gate == "front":
-        return gate_front()
-    if args.gate == "chain":
-        return gate_chain()
+    if args.gate:
+        if args.wall != "RW20":
+            print("gates are defined against the RW20 production tree only")
+            return 2
+        return gate_front() if args.gate == "front" else gate_chain()
     if not (args.pred and args.tag):
         print("need --pred and --tag (or --gate front|chain)")
         return 2
-    tree, _cov = build_parallel_tree(args.pred, args.tag)
-    mech = run_chain(tree, args.tag)
-    score(mech, args.tag, RESULTS / f"axis_c_{args.tag}.csv")
+    if args.wall == "RW20C" and args.space == "crop":
+        print("RW20C pool masks are FULL-frame (A1.35) - pass --space full")
+        return 2
+    pred = args.pred
+    if args.space == "crop":
+        pred = lift_crop_to_fullframe(pred, args.tag)
+    tree, _cov = build_parallel_tree(pred, args.tag, args.wall)
+    mech = run_chain(tree, args.tag, args.wall)
+    score(mech, args.tag, RESULTS / f"axis_c_{args.tag}.csv", args.wall)
     return 0
 
 

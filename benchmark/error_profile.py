@@ -115,17 +115,22 @@ def main() -> int:
     ap.add_argument("--data-root", type=Path, default=Path("data"))
     ap.add_argument("--runs-dir", type=Path, default=Path("runs"))
     ap.add_argument("--marked-list", type=Path,
-                    default=Path("marked_line_images.txt"))
+                    default=Path(__file__).resolve().parent /
+                    "marked_line_images.txt")
     ap.add_argument("--out", type=Path, default=None)
     a = ap.parse_args()
     if a.selftest:
         return selftest()
 
-    marked = set()
-    if a.marked_list.exists():
-        marked = {ln.strip() for ln in
-                  a.marked_list.read_text(encoding="utf-8").splitlines()
-                  if ln.strip() and not ln.startswith("#")}
+    # a missing list must be an ERROR, not a silent empty set: every row
+    # would get marked=0 and the marked-FP columns would quietly read as
+    # "no grid-line problem" (the sect 8aq class - a gate that cannot fire)
+    if not a.marked_list.exists():
+        print(f"FATAL: marked list not found: {a.marked_list}")
+        return 1
+    marked = {ln.strip() for ln in
+              a.marked_list.read_text(encoding="utf-8").splitlines()
+              if ln.strip() and not ln.startswith("#")}
 
     rows, gt_cache = [], {}
     triples = discover(a.results)

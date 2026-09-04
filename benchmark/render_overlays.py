@@ -367,11 +367,13 @@ def pick_mechanism(rows: list, marked: set) -> list:
 def cmd_figset(args):
     gts = load_gt_masks(args.fold / "test")
     wall = args.fold.name.replace("fold_", "")
-    marked = set()
-    if args.marked_list and args.marked_list.exists():
-        marked = {l.strip() for l in
-                  args.marked_list.read_text(encoding="utf-8").splitlines()
-                  if l.strip() and not l.startswith("#")}
+    # missing list = ERROR: the grid_line/written_number mechanism rules
+    # would silently pick from an empty candidate set otherwise
+    if not (args.marked_list and args.marked_list.exists()):
+        raise SystemExit(f"FATAL: marked list not found: {args.marked_list}")
+    marked = {l.strip() for l in
+              args.marked_list.read_text(encoding="utf-8").splitlines()
+              if l.strip() and not l.startswith("#")}
     args.out.mkdir(parents=True, exist_ok=True)
     man = []
     for model in args.models:
@@ -541,7 +543,8 @@ def main():
     g.add_argument("--per-image", type=Path,
                    default=Path("results/benchmark/per_image_metrics.csv"))
     g.add_argument("--marked-list", type=Path,
-                   default=Path("marked_line_images.txt"))
+                   default=Path(__file__).resolve().parent /
+                   "marked_line_images.txt")
     g.add_argument("--metric", default="cliou_4px")
     g.add_argument("--runs-dir", type=Path, default=Path("runs"))
     g.add_argument("--manifest", type=Path, default=None)
