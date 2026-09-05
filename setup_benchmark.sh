@@ -291,6 +291,16 @@ FAILED - predict_sliding_window would crash on any image with exactly one
 side smaller than tile_size. Fix it in the repo and git pull; do NOT patch
 it on the instance."
 python3 benchmark/eval_masks.py --selftest || die "eval_masks selftest FAILED"
+# Fusion math gate (fusion_ab_spec G-F2): the overlap-fusion accumulation
+# lives in pure-numpy module-level helpers inside infer_sam.py precisely so
+# this can run them from the shipped source (ast+exec, no torch, ~0.2 s).
+# Includes a NEGATIVE case: a mean that divides by detecting tiles instead
+# of tile visits must be flagged - that is what proves the gate can see.
+python3 benchmark/check_fusion_math.py || die "fusion math gate FAILED -
+the max/mean accumulation in infer_sam.py no longer matches the frozen
+spec (docs/fusion_ab_spec.md). Fix it in the repo and git pull; do NOT
+patch it on the instance."
+python3 benchmark/fusion_ab.py --selftest || die "fusion_ab selftest FAILED"
 # to_nnunet runs only in the LAST block of the queue (row A1), so a bad
 # dataset.json or label range would surface after every training hour was
 # already paid for (Amendment A1.5). Two seconds here instead.

@@ -100,6 +100,65 @@ def _open_image_oriented(path):
     return PILImageOps.exif_transpose(PILImage.open(path)).convert("RGB")
 
 
+# ----------------------------------------------------------------------
+# Overlap-fusion accumulation (docs/fusion_ab_spec.md, frozen 2026-09-05)
+# ----------------------------------------------------------------------
+# PURE-NUMPY module-level helpers ON PURPOSE: this file imports sam3 at
+# module scope and cannot be imported on the dev box, so by the 8bz rule
+# the fusion math needs a static gate — benchmark/check_fusion_math.py
+# extracts these three functions from the shipped source with `ast` and
+# execs them with numpy only. Keep them free of torch/sam3/self.
+
+def _fusion_visit(count, xo, yo, tile_h, tile_w, H, W):
+    """Count one tile visit at (xo, yo) into the per-pixel visit map.
+
+    Called for EVERY tile, including zero-detection tiles — the mean
+    denominator is tile VISITS, not detecting tiles (counting only
+    detecting tiles would bias the mean upward; spec §2). Clipping is the
+    A1.32 rule: PIL crop pads past the canvas, the padded rows/cols are
+    not part of the image.
+    """
+    th = min(tile_h, H - yo)
+    tw = min(tile_w, W - xo)
+    if th > 0 and tw > 0:
+        count[yo:yo + th, xo:xo + tw] += 1
+
+
+def _fusion_tile_accumulate(state, prob, xo, yo, H, W):
+    """Fold one tile's probability map into the fusion state.
+
+    prob: (tile_h, tile_w) float32, per-pixel max over kept instances of
+    sigmoid(mask logits) — 0 where no instance fired. state holds
+    'score_max' and/or 'score_sum' full-canvas float32 arrays; only the
+    keys present are accumulated (fusion='max' allocates no sum).
+    """
+    th = min(prob.shape[0], H - yo)
+    tw = min(prob.shape[1], W - xo)
+    if th <= 0 or tw <= 0:
+        return
+    win = prob[:th, :tw]
+    if "score_max" in state:
+        dst = state["score_max"][yo:yo + th, xo:xo + tw]
+        np.maximum(dst, win, out=dst)
+    if "score_sum" in state:
+        state["score_sum"][yo:yo + th, xo:xo + tw] += win
+
+
+def _fusion_finalize(state, count, threshold):
+    """Binarize the accumulated score maps. Returns {mode: bool mask}.
+
+    mean divides by max(count, 1): a pixel no tile ever visited (cannot
+    happen with flush-edge origins, but the guard costs nothing) reads 0.
+    Threshold is FROZEN at 0.5 for the A/B study (spec §2).
+    """
+    out = {}
+    if "score_max" in state:
+        out["max"] = state["score_max"] > threshold
+    if "score_sum" in state:
+        out["mean"] = (state["score_sum"] / np.maximum(count, 1)) > threshold
+    return out
+
+
 class SAM3LoRAInference:
     """SAM3 model with LoRA for inference."""
 
@@ -382,6 +441,7 @@ class SAM3LoRAInference:
         apply_preprocess: bool = True,
         apply_postprocess: Optional[bool] = None,
         verbose: bool = True,
+        return_probs: bool = False,
     ) -> dict:
         """
         Run inference on an image with text prompts.
@@ -519,8 +579,29 @@ class SAM3LoRAInference:
                     ).squeeze(0) > 0.5
 
                     masks_np = masks_resized.cpu().numpy()
+
+                    # ---- Optional continuous probability map (fusion A/B,
+                    # docs/fusion_ab_spec.md). Per-pixel max over kept
+                    # instances of the RESIZED CONTINUOUS sigmoid — the
+                    # binary path above (threshold->resize->threshold) is
+                    # deliberately untouched, so --fusion or stays
+                    # byte-identical (spec G-F1). Declared: the two
+                    # binarization boundaries differ slightly (spec §2).
+                    if return_probs:
+                        probs_small = pred_masks[0, keep][keep_nms].sigmoid()
+                        probs_resized = F.interpolate(
+                            probs_small.unsqueeze(0),
+                            size=(orig_h, orig_w),
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(0)
+                        prob_map_np = (probs_resized.max(dim=0)[0]
+                                       .cpu().numpy().astype(np.float32))
+                    else:
+                        prob_map_np = None
                 else:
                     masks_np = None
+                    prob_map_np = None
 
                 # ---- Optional morphological post-processing (per instance) ----
                 if do_pp and masks_np is not None and len(masks_np) > 0:
@@ -535,6 +616,8 @@ class SAM3LoRAInference:
                     'masks': masks_np,
                     'num_detections': num_keep,
                 }
+                if return_probs and prob_map_np is not None:
+                    entry['prob_map'] = prob_map_np
 
                 # ---- Optional skeleton (1-px centerline of union mask) ----
                 if self.use_skeleton and masks_np is not None:
@@ -575,6 +658,8 @@ class SAM3LoRAInference:
         tile_size: int = 640,
         overlap: float = 0.25,
         show_progress: bool = True,
+        fusion: str = "or",
+        fusion_threshold: float = 0.5,
     ) -> dict:
         """
         Run inference on overlapping tiles of the full-resolution image, then
@@ -614,6 +699,21 @@ class SAM3LoRAInference:
         """
         assert 0.0 <= overlap < 1.0, "overlap must be in [0, 1)"
 
+        # ---- Overlap-fusion mode (docs/fusion_ab_spec.md) ----------------
+        # "or"  : the existing binary OR union — the DEFAULT, and the code
+        #         path below is untouched when selected (spec G-F1).
+        # "max" : per-pixel max of continuous tile probabilities, > thr.
+        # "mean": per-pixel mean over TILE VISITS (incl. zero-detection
+        #         tiles), > thr.
+        # "all" : accumulate every mode in ONE pass (same forward per tile);
+        #         canonical result stays the OR union, the rest land in
+        #         entry["fusion_masks"].
+        if fusion not in ("or", "max", "mean", "all"):
+            raise ValueError(f"fusion must be or|max|mean|all, got {fusion!r}")
+        want_max = fusion in ("max", "all")
+        want_mean = fusion in ("mean", "all")
+        want_probs = want_max or want_mean
+
         # Accept either a path or a PIL image
         if isinstance(image_path, PILImage.Image):
             pil_full = image_path.convert("RGB")
@@ -642,7 +742,38 @@ class SAM3LoRAInference:
         # Degenerate case: image smaller than one tile → fall back to regular predict
         if W <= tile_size and H <= tile_size:
             print("   Image ≤ tile_size, falling back to single-image predict()")
-            return self.predict(image_path, text_prompts)
+            fb = self.predict(image_path, text_prompts,
+                              return_probs=want_probs)
+            if want_probs:
+                # One tile ⇒ no overlap ⇒ max == mean == prob > threshold.
+                # Attach fusion_masks so callers of --fusion all get the
+                # same schema instead of a silent drop (spec G-F3 relies
+                # on every image producing every requested mode).
+                for q_idx in range(len(text_prompts)):
+                    r = fb.get(q_idx)
+                    if not isinstance(r, dict):
+                        continue
+                    pm = r.get("prob_map")
+                    if pm is None:
+                        fused = np.zeros((H, W), dtype=bool)
+                    else:
+                        fused = pm > fusion_threshold
+                    if self.use_postprocess:
+                        fused = self._postprocess_mask(fused).astype(bool)
+                    fm = {}
+                    if fusion in ("or", "all"):
+                        m = r.get("masks")
+                        fm["or"] = (np.asarray(m).any(axis=0) > 0
+                                    if m is not None
+                                    else np.zeros((H, W), dtype=bool))
+                    if want_max:
+                        fm["max"] = fused
+                    if want_mean:
+                        fm["mean"] = fused.copy()
+                    r["fusion_masks"] = fm
+                    if fusion in ("max", "mean"):
+                        r["masks"] = fm[fusion][None, :, :]
+            return fb
 
         # Build tile origins; always include a final tile flush with the edge
         def _origins(length: int) -> List[int]:
@@ -666,6 +797,18 @@ class SAM3LoRAInference:
             "scores": [],
         } for idx in range(len(text_prompts))}
 
+        # Fusion score state (spec §2). Allocated only when requested so the
+        # default --fusion or path carries zero extra memory or work.
+        if want_probs:
+            for idx in range(len(text_prompts)):
+                if want_max:
+                    merged[idx]["score_max"] = np.zeros((H, W), np.float32)
+                if want_mean:
+                    merged[idx]["score_sum"] = np.zeros((H, W), np.float32)
+            # Visit count is prompt-independent: every tile visits the same
+            # pixels regardless of what it detects.
+            visit_count = np.zeros((H, W), np.uint16)
+
         # Flatten tile positions so tqdm can show a single progress bar
         tile_positions = [(xo, yo) for yo in y_origins for xo in x_origins]
 
@@ -688,10 +831,29 @@ class SAM3LoRAInference:
                 apply_preprocess=False,
                 apply_postprocess=False,
                 verbose=False,
+                return_probs=want_probs,
             )
+
+            # Fusion: count the visit for EVERY tile, detections or not —
+            # the mean denominator is tile visits (spec §2; a
+            # detecting-tiles-only count is the bias the negative case of
+            # check_fusion_math is built to catch).
+            if want_probs:
+                _fusion_visit(visit_count, xo, yo,
+                              tile.size[1], tile.size[0], H, W)
 
             for q_idx in range(len(text_prompts)):
                 r = tile_results.get(q_idx, {})
+
+                # Fusion score accumulation (zero-detection tiles contribute
+                # p_t = 0 by simply not accumulating — max unchanged, sum
+                # unchanged, while the visit above still counted).
+                if want_probs and isinstance(r, dict):
+                    pm = r.get("prob_map")
+                    if pm is not None:
+                        _fusion_tile_accumulate(merged[q_idx], pm,
+                                                xo, yo, H, W)
+
                 if not r or r.get("num_detections", 0) == 0:
                     continue
 
@@ -731,13 +893,26 @@ class SAM3LoRAInference:
         final = {}
         for q_idx, agg in merged.items():
             if len(agg["boxes"]) == 0:
-                final[q_idx] = {
+                empty_entry = {
                     "prompt": agg["prompt"],
                     "boxes": None,
                     "scores": None,
                     "masks": None,
                     "num_detections": 0,
                 }
+                if want_probs:
+                    # All-zero fused masks so --fusion all always yields the
+                    # full mode set (harness asserts one file per mode);
+                    # canonical masks stays None — OR semantics untouched.
+                    fm = {}
+                    if fusion == "all":
+                        fm["or"] = np.zeros((H, W), dtype=bool)
+                    if want_max:
+                        fm["max"] = np.zeros((H, W), dtype=bool)
+                    if want_mean:
+                        fm["mean"] = np.zeros((H, W), dtype=bool)
+                    empty_entry["fusion_masks"] = fm
+                final[q_idx] = empty_entry
                 continue
 
             all_boxes = np.concatenate(agg["boxes"], axis=0)    # (N, 4) xyxy
@@ -765,9 +940,31 @@ class SAM3LoRAInference:
             else:
                 union_pp = union_raw
 
+            # ---- Fused score masks (docs/fusion_ab_spec.md §2) -----------
+            # boxes/scores/num_detections are identical across modes — the
+            # fusion changes ONLY the mask (declared in the spec).
+            fusion_masks = None
+            if want_probs:
+                fused = _fusion_finalize(agg, visit_count, fusion_threshold)
+                if self.use_postprocess:
+                    fused = {m: self._postprocess_mask(v).astype(bool)
+                             for m, v in fused.items()}
+                fusion_masks = {}
+                if fusion == "all":
+                    fusion_masks["or"] = union_pp.astype(bool)
+                fusion_masks.update(fused)
+
+            # Canonical mask: the requested single mode; "all" keeps the OR
+            # union so every downstream consumer of results[q]["masks"] sees
+            # exactly what it sees today.
+            if fusion in ("max", "mean"):
+                union_final = fusion_masks[fusion]
+            else:
+                union_final = union_pp
+
             # mask_union is a single merged binary mask; expose as (1, H, W)
             # to keep downstream code (which does masks.any(axis=0)) happy.
-            union_mask = union_pp[None, :, :]
+            union_mask = union_final[None, :, :]
 
             entry = {
                 "prompt": agg["prompt"],
@@ -776,10 +973,13 @@ class SAM3LoRAInference:
                 "masks": union_mask,
                 "num_detections": n_kept,
             }
+            if fusion_masks is not None:
+                entry["fusion_masks"] = fusion_masks
 
-            # Optional skeleton on the final (post-processed) union mask
+            # Optional skeleton on the final (post-processed) canonical mask
+            # (union_final == union_pp unless fusion selected max/mean).
             if self.use_skeleton:
-                entry["skeleton"] = self._skeletonize_mask(union_pp)
+                entry["skeleton"] = self._skeletonize_mask(union_final)
 
             final[q_idx] = entry
 
@@ -1224,6 +1424,23 @@ def main():
         action="store_true",
         help="Disable the tqdm progress bar during sliding-window inference"
     )
+    parser.add_argument(
+        "--fusion",
+        choices=["or", "max", "mean", "all"],
+        default="or",
+        help="Overlap-fusion mode for sliding-window inference "
+             "(docs/fusion_ab_spec.md). 'or' = existing binary OR union "
+             "(default, byte-identical path); 'max'/'mean' = per-pixel "
+             "score fusion; 'all' = accumulate every mode in one pass and "
+             "save each as {output_base}_mask_<mode>.png (with --save-mask)."
+    )
+    parser.add_argument(
+        "--fusion-threshold",
+        type=float,
+        default=0.5,
+        help="Binarisation threshold on fused score maps (default: 0.5 — "
+             "FROZEN for the A/B study; do not tune post hoc)."
+    )
 
     # Test-time augmentation (Tier 1, item 2 in next-steps roadmap)
     parser.add_argument(
@@ -1344,6 +1561,11 @@ def main():
     if args.tta and args.sliding_window:
         raise SystemExit("--tta and --sliding-window can't be combined yet. "
                          "Pick one for now.")
+    if args.fusion != "or" and not args.sliding_window:
+        # A silent no-op here would let a harness believe it ran max/mean
+        # fusion while getting single-pass masks — fail loudly instead.
+        raise SystemExit("--fusion max|mean|all requires --sliding-window "
+                         "(score fusion is defined over overlapping tiles).")
     if args.tta:
         results = inferencer.predict_tta(
             args.image, args.prompt,
@@ -1358,6 +1580,8 @@ def main():
             tile_size=args.tile_size,
             overlap=args.tile_overlap,
             show_progress=not args.no_progress,
+            fusion=args.fusion,
+            fusion_threshold=args.fusion_threshold,
         )
     else:
         results = inferencer.predict(args.image, args.prompt)
@@ -1378,18 +1602,36 @@ def main():
         base, _ = os.path.splitext(args.output)
         entry = None
         for k in sorted(kk for kk in results.keys() if not str(kk).startswith('_')):
-            if results[k].get('masks') is not None:
+            if (results[k].get('masks') is not None
+                    or results[k].get('fusion_masks')):
                 entry = results[k]; break
         if entry is None:
             print("⚠️  no mask to save (0 detections)")
         else:
-            masks = np.asarray(entry['masks'])                       # (N,H,W) or (1,H,W)
-            union = (masks.any(axis=0) if masks.ndim == 3 else masks) > 0
-            H, W = union.shape
-            if args.save_mask:
+            # ---- Per-mode fused masks (--fusion max|mean|all) ------------
+            # Written BEFORE the canonical mask so a zero-detection image
+            # under --fusion all still yields one file per mode (all-zero),
+            # which the A/B harness asserts on (fusion_ab_spec G-F3).
+            fm = entry.get('fusion_masks')
+            if args.save_mask and fm:
+                for mode in sorted(fm):
+                    m8 = (np.asarray(fm[mode]) > 0).astype(np.uint8) * 255
+                    _cv2.imwrite(f"{base}_mask_{mode}.png", m8)
+                    print(f"💾 Saved fused mask [{mode}]: "
+                          f"{base}_mask_{mode}.png")
+            if entry.get('masks') is None:
+                print("⚠️  no canonical mask to save (0 detections)")
+                masks = None
+            else:
+                masks = np.asarray(entry['masks'])                   # (N,H,W) or (1,H,W)
+            union = (None if masks is None else
+                     ((masks.any(axis=0) if masks.ndim == 3 else masks) > 0))
+            if union is not None:
+                H, W = union.shape
+            if args.save_mask and union is not None:
                 _cv2.imwrite(f"{base}_mask.png", (union.astype(np.uint8) * 255))
                 print(f"💾 Saved binary mask: {base}_mask.png")
-            if args.save_json:
+            if args.save_json and union is not None:
                 m8 = union.astype(np.uint8)
                 n_lab, labels, stats, cents = _cv2.connectedComponentsWithStats(m8, connectivity=8)
                 comps = []

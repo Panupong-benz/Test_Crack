@@ -156,7 +156,15 @@ def main():
          "mode": mode, "config": str(args.config),
          "weights": None if args.weights is None else str(args.weights),
          "threshold": args.threshold,
-         "fusion": "or_union+morphology (production infer_sam)",
+         # A1.4 item 37 records the production path as OR-union with the
+         # 0.30 detection gate; the old string here also claimed
+         # "+morphology", which was FALSE metadata - this shim never passes
+         # --postprocess (corrected 2026-09-05, fusion_ab_spec 7). When a
+         # --fusion flag rides in via --extra, record it verbatim.
+         "fusion": (args.extra.split()[args.extra.split().index("--fusion") + 1]
+                    if "--fusion" in args.extra.split()
+                    else "or_union (production infer_sam; no morphology)"),
+         "extra": args.extra,
          "sec_total": round(time.time() - t_all, 1),
          "sec_per_image_mean": (round(sum(secs) / len(secs), 2)
                                 if secs else None),
